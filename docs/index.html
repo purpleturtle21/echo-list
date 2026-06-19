@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EchoList — Playlist Manager</title>
+<style>
+  :root { --bg: #1a1a1a; --panel: #222; --fg: #ccc; --dim: #888; --red: #cc3333; --green: #4a4; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font-family: 'Consolas', 'Courier New', monospace; line-height: 1.6; }
+  a { color: var(--red); }
+  .container { max-width: 780px; margin: 0 auto; padding: 2rem 1.5rem; }
+  h1 { color: var(--red); font-size: 2.4rem; margin-bottom: 0.2rem; }
+  h1 span { color: var(--dim); font-size: 1rem; font-weight: normal; }
+  h2 { color: var(--red); font-size: 1.2rem; margin: 2rem 0 0.6rem; border-bottom: 1px solid #333; padding-bottom: 0.3rem; }
+  h3 { color: var(--fg); font-size: 1rem; margin: 1.2rem 0 0.4rem; }
+  p, li { margin-bottom: 0.5rem; }
+  ul { padding-left: 1.5rem; }
+  code { background: var(--panel); padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.9rem; }
+  pre { background: var(--panel); padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 0.8rem 0; border-left: 3px solid var(--red); }
+  pre code { background: none; padding: 0; }
+  .badge { display: inline-block; background: var(--green); color: #fff; font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 3px; margin-left: 0.5rem; }
+  .warn { background: #2a1a1a; border: 1px solid var(--red); border-radius: 4px; padding: 1rem; margin: 1rem 0; }
+  .warn strong { color: var(--red); }
+  .safety { background: #1a2a1a; border: 1px solid var(--green); border-radius: 4px; padding: 1rem; margin: 1rem 0; }
+  .safety strong { color: var(--green); }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #333; color: var(--dim); font-size: 0.8rem; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>ECHOLIST <span>Adds playlist support to the SnowSky Echo Mini</span></h1>
+
+<p>The Echo Mini does not offer the playlist experience many users expect because the SoC is incompatible with <code>.m3u</code> files. EchoList provides a simple way to build playlists, organize tracks, and sync them to your device.</p>
+
+<p>With EchoList, songs can belong to multiple playlists while keeping your albums and library structure clean.</p>
+
+<h2>Download</h2>
+<p>Pre-built binaries for Windows, Linux, and macOS are available on the <a href="https://github.com/purpleturtle21/echo-mini-sync/releases">Releases</a> page.</p>
+
+<p><strong>macOS:</strong> Download <code>echolist-macos-arm64</code> (Apple Silicon) or <code>echolist-macos-intel</code> (older Macs). Apple will block the app because it is not signed. To open it, run:</p>
+<pre><code>xattr -cr echolist-macos-*
+chmod +x echolist-macos-*
+./echolist-macos-arm64   # or ./echolist-macos-intel</code></pre>
+
+<p><strong>Windows:</strong> SmartScreen may show "Windows protected your PC." Click <strong>More info</strong> → <strong>Run anyway</strong>.</p>
+
+<h2>Features</h2>
+<ul>
+  <li>Create, rename, and delete playlists</li>
+  <li>Add and remove tracks</li>
+  <li>Drag-and-drop track ordering</li>
+  <li>Undo support</li>
+  <li>Batch synchronization</li>
+</ul>
+
+<h2>Advantages</h2>
+
+<h3>Multiple Playlist Membership</h3>
+<p>A song can belong to multiple playlists at the same time. Unlike the Genre workaround, you are not limited to a single playlist per track.</p>
+
+<h3>Clean Library Integration</h3>
+<p>Playlists appear inside the normal Music Library.</p>
+<pre><code>Artists                    Albums
+├── AC/DC                  ├── Back In Black
+├── Scorpions              ├── Love at First Sting
+├── Daft Punk              ├── Discovery
+│                          │
+└── Playlists              ├── Driving
+    ├── Driving            ├── Party
+    ├── Party              └── Gym
+    └── Gym</code></pre>
+
+<h3>Albums Remain Untouched</h3>
+<p>You can keep a complete album while also placing selected songs into playlists. Browsing by album or artist behaves normally and is not polluted by playlist entries.</p>
+
+<h2>Drawbacks</h2>
+
+<h3>Additional Storage Usage</h3>
+<p>EchoList creates a physical copy of each song that is added to a playlist. Storage usage increases depending on the number of playlist tracks.</p>
+
+<h3>Shuffle-All Bias</h3>
+<p>Tracks that appear in multiple playlists exist multiple times on the device. As a result, Shuffle All will play those songs more frequently.</p>
+
+<h3>Playlist-Only Tracks Are Not Artist Tracks</h3>
+<p>Tracks that exist only as playlist entries will not behave like normal artist-library tracks when browsing by artist.</p>
+
+<div class="warn">
+<strong>Safety Notice:</strong> EchoList is almost completely a vibe-coded app. It includes multiple safeguards to reduce the risk of accidental data loss, but nothing is fail-proof. You should always keep backups of your music library, existing playlists, and your SD card contents.
+</div>
+
+<h2>How It Works</h2>
+<ol>
+  <li>Select your music library.</li>
+  <li>Create one or more playlists.</li>
+  <li>Add tracks and arrange them as desired.</li>
+  <li>Press <strong>Sync</strong>.</li>
+</ol>
+<p>EchoList handles the rest.</p>
+
+<h2>Contributing</h2>
+<p>Bug reports, suggestions, and pull requests are welcome. Go wild.</p>
+<p>If you test EchoList on devices other than the Echo Mini, feel free to share your results.</p>
+
+<footer>
+  EchoList &mdash; MIT License &mdash; built with Python, mutagen, and tkinter.
+</footer>
+
+</div>
+</body>
+</html>

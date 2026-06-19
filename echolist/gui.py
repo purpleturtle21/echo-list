@@ -1,0 +1,1572 @@
+"""EchoList GUI — dark/red cassette-player theme with staged sync."""
+from __future__ import annotations
+
+import json
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+from threading import Thread
+
+import os
+import signal
+import platform
+import string
+
+from .manager import PlaylistManager, AUDIO_EXTS
+from .naming import playlist_id, sanitize
+from .config import load_defaults, save_defaults
+
+
+def _detect_echo_mini() -> str | None:
+    system = platform.system()
+    if system == "Windows":
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if ctypes.windll.kernel32.GetDriveTypeW(drive) == 2:  # DRIVE_REMOVABLE
+                if ctypes.windll.kernel32.GetVolumeInformationW(
+                    drive, buf, 1024, None, None, None, None, 0
+                ):
+                    if buf.value.upper() == "ECHO MINI":
+                        return drive
+    elif system == "Darwin":
+        volumes = Path("/Volumes")
+        if volumes.exists():
+            for vol in volumes.iterdir():
+                if vol.name.upper() == "ECHO MINI" and vol.is_dir():
+                    return str(vol)
+    else:
+        for base in (Path("/media"), Path("/run/media")):
+            if not base.exists():
+                continue
+            for user_dir in base.iterdir():
+                if not user_dir.is_dir():
+                    continue
+                for vol in user_dir.iterdir():
+                    if vol.name.upper() == "ECHO MINI" and vol.is_dir():
+                        return str(vol)
+    return None
+
+
+def _default_source() -> str:
+    music = Path.home() / "Music"
+    if music.exists():
+        return str(music)
+    return str(Path.home())
+
+
+def _is_external_path(path: str) -> bool:
+    system = platform.system()
+    if system == "Windows":
+        try:
+            import ctypes
+            drive = Path(path).anchor
+            return ctypes.windll.kernel32.GetDriveTypeW(drive) == 2
+        except Exception:
+            return False
+    elif system == "Darwin":
+        return path.startswith("/Volumes/")
+    else:
+        return path.startswith("/media/") or path.startswith("/run/media/")
+
+
+# ── Theme colors ──
+BG = "#1a1a1a"
+BG_PANEL = "#222222"
+BG_INPUT = "#2a2a2a"
+FG = "#cccccc"
+FG_DIM = "#888888"
+FG_BRIGHT = "#eeeeee"
+RED = "#cc3333"
+RED_DARK = "#991111"
+RED_BRIGHT = "#ff4444"
+GREEN = "#44aa44"
+YELLOW = "#ccaa33"
+BORDER = "#333333"
+PENDING_FG = "#cc9933"
+
+MAX_TRACKS = 8192
+PENDING_FILE = Path.home() / ".echolist" / "pending.json"
+_HIDDEN_DIRS = frozenset({
+    "playlists", "system volume information", "$recycle.bin",
+    "recycler", "found.000", "msos",
+})
+
+
+def _read_tags_from_file(path: Path) -> tuple[str, str]:
+    try:
+        import mutagen
+        m = mutagen.File(path, easy=True)
+        if m:
+            return m.get("title", [""])[0], m.get("artist", [""])[0]
+    except Exception:
+        pass
+    return path.stem, ""
+
+
+class StagingState:
+    """Tracks pending add/remove operations before SYNC."""
+
+    def __init__(self):
+        self.pending_adds: list[dict] = []
+        self.pending_removes: list[dict] = []
+        self.pending_reorders: dict[str, list] = {}
+        self._load()
+
+    def _load(self):
+        if PENDING_FILE.exists():
+            try:
+                data = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+                self.pending_adds = data.get("adds", [])
+                self.pending_removes = data.get("removes", [])
+                self.pending_reorders = data.get("reorders", {})
+            except Exception:
+                pass
+
+    def save(self):
+        PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PENDING_FILE.write_text(json.dumps({
+            "adds": self.pending_adds,
+            "removes": self.pending_removes,
+            "reorders": self.pending_reorders,
+        }, indent=2), encoding="utf-8")
+
+    def clear(self):
+        self.pending_adds.clear()
+        self.pending_removes.clear()
+        self.pending_reorders.clear()
+        if PENDING_FILE.exists():
+            PENDING_FILE.unlink()
+
+    def stage_add(self, pid: str, src: str, title: str, artist: str):
+        self.pending_adds.append({
+            "pid": pid, "src": src, "title": title, "artist": artist,
+        })
+        self.save()
+
+    def stage_remove(self, pid: str, index: int, copy_name: str):
+        self.pending_removes.append({
+            "pid": pid, "index": index, "copy_name": copy_name,
+        })
+        self.save()
+
+    def set_reorder(self, pid: str, order: list[dict]):
+        self.pending_reorders[pid] = order
+        self.save()
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self.pending_adds or self.pending_removes or self.pending_reorders)
+
+    @property
+    def total_ops(self) -> int:
+        return len(self.pending_adds) + len(self.pending_removes) + len(self.pending_reorders)
+
+    def virtual_tracks(self, pid: str, committed_tracks: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Returns (active_tracks, removed_tracks)."""
+        removed_indices = {
+            r["index"] for r in self.pending_removes if r["pid"] == pid
+        }
+        result = []
+        removed = []
+        for t in committed_tracks:
+            if t["index"] in removed_indices:
+                removed.append({**t, "_pending": False, "_removed": True, "_key": f"c:{t['index']}"})
+            else:
+                result.append({**t, "_pending": False, "_key": f"c:{t['index']}"})
+
+        pending_count = 0
+        for a in self.pending_adds:
+            if a["pid"] == pid:
+                result.append({
+                    "index": 0,
+                    "title": a["title"],
+                    "artist": a["artist"],
+                    "src_path": a["src"],
+                    "_pending": True,
+                    "_key": f"p:{pending_count}",
+                })
+                pending_count += 1
+
+        if pid in self.pending_reorders:
+            order = self.pending_reorders[pid]
+            by_key = {}
+            for t in result:
+                by_key[t["_key"]] = t
+            reordered = []
+            for entry in order:
+                if entry["key"] in by_key:
+                    reordered.append(by_key.pop(entry["key"]))
+            for leftover in by_key.values():
+                reordered.append(leftover)
+            result = reordered
+
+        for i, t in enumerate(result, 1):
+            t["index"] = i
+
+        return result, removed
+
+    def virtual_track_count(self, store) -> int:
+        committed = sum(len(p["tracks"]) for p in store.playlists.values())
+        return committed + len(self.pending_adds) - len(self.pending_removes)
+
+
+ICON_PATH = Path(__file__).with_name("echolist.ico")
+ICON_PNG_PATH = Path(__file__).with_name("echolist.png")
+
+
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("EchoList")
+        self.root.configure(bg=BG)
+        self._set_icon()
+        self._center_window(420, 700)
+        self.root.minsize(380, 550)
+        self.mgr = None
+        self.source = None
+        self.dest = None
+        self.current_pid = None
+        self.staging = StagingState()
+        self._undo_stack: list[dict] = []
+        self._sort_col = None
+        self._sort_reverse = False
+        self._drag_data = None
+        self._cached_device_tracks = 0
+        self._cached_workspace_bytes = 0
+        self._stats_pending = False
+        self._alive = True
+        self._apply_theme()
+        self._show_setup()
+
+    def _set_icon(self):
+        if ICON_PNG_PATH.exists():
+            try:
+                icon = tk.PhotoImage(file=str(ICON_PNG_PATH))
+                self.root.iconphoto(True, icon)
+                self._icon_ref = icon
+            except tk.TclError:
+                pass
+        if ICON_PATH.exists():
+            try:
+                self.root.iconbitmap(str(ICON_PATH))
+            except tk.TclError:
+                pass
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("echolist.app")
+        except Exception:
+            pass
+
+    def run(self):
+        self.root.mainloop()
+
+    def _center_window(self, w, h):
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _apply_theme(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        style.configure(".", background=BG, foreground=FG, fieldbackground=BG_INPUT,
+                         bordercolor=BORDER, darkcolor=BG, lightcolor=BG,
+                         troughcolor=BG_PANEL, selectbackground=RED_DARK,
+                         selectforeground=FG_BRIGHT, font=("Consolas", 9))
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=FG)
+        style.configure("TButton", background=BG_PANEL, foreground=FG, bordercolor=BORDER, padding=4)
+        style.map("TButton",
+                   background=[("active", RED_DARK), ("pressed", RED)],
+                   foreground=[("active", FG_BRIGHT)])
+        style.configure("Accent.TButton", background=RED_DARK, foreground=FG_BRIGHT)
+        style.map("Accent.TButton",
+                   background=[("active", RED), ("pressed", RED_BRIGHT)])
+        style.configure("Sync.TButton", background=RED, foreground=FG_BRIGHT,
+                         font=("Consolas", 11, "bold"), padding=6)
+        style.map("Sync.TButton",
+                   background=[("active", RED_BRIGHT), ("pressed", RED_DARK)])
+        style.configure("TEntry", fieldbackground=BG_INPUT, foreground=FG_BRIGHT,
+                         insertcolor=FG_BRIGHT, bordercolor=BORDER)
+        style.configure("Title.TLabel", font=("Consolas", 18, "bold"), foreground=RED, background=BG)
+        style.configure("Section.TLabel", font=("Consolas", 10, "bold"), foreground=RED, background=BG)
+        style.configure("Treeview", background=BG_INPUT, foreground=FG, fieldbackground=BG_INPUT,
+                         bordercolor=BORDER, font=("Consolas", 9), rowheight=22)
+        style.configure("Treeview.Heading", background=BG_PANEL, foreground=RED,
+                         bordercolor=BORDER, font=("Consolas", 9, "bold"))
+        style.map("Treeview",
+                   background=[("selected", RED_DARK)],
+                   foreground=[("selected", FG_BRIGHT)])
+        style.configure("TScrollbar", background=BG_PANEL, troughcolor=BG,
+                         bordercolor=BG, arrowcolor=FG_DIM)
+        style.configure("TPanedwindow", background=BORDER)
+        style.configure("Red.Horizontal.TProgressbar", troughcolor=BG_PANEL,
+                         background=RED, bordercolor=BORDER)
+        style.configure("Green.Horizontal.TProgressbar", troughcolor=BG_PANEL,
+                         background=GREEN, bordercolor=BORDER)
+        style.configure("Yellow.Horizontal.TProgressbar", troughcolor=BG_PANEL,
+                         background=YELLOW, bordercolor=BORDER)
+        style.configure("Sync.Horizontal.TProgressbar", troughcolor=BG_PANEL,
+                         background=RED, bordercolor=BORDER)
+
+    # ── Setup ──
+
+    def _show_setup(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.root.config(menu=tk.Menu(self.root))
+        self._center_window(420, 280)
+
+        frame = ttk.Frame(self.root, padding=20)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="ECHOLIST", style="Title.TLabel").pack(pady=(0, 20))
+
+        self._setup_status = tk.Label(frame, text="Searching for Echo Mini...",
+                                       font=("Consolas", 10), bg=BG, fg=FG_DIM,
+                                       wraplength=350)
+        self._setup_status.pack(pady=(0, 10))
+
+        self._setup_btn_frame = ttk.Frame(frame)
+        self._setup_btn_frame.pack(pady=(5, 10))
+
+        adv_lbl = tk.Label(frame, text="Advanced setup...",
+                            font=("Consolas", 9, "underline"),
+                            bg=BG, fg=FG_DIM, cursor="hand2")
+        adv_lbl.pack(pady=(10, 0))
+        adv_lbl.bind("<Button-1>", lambda e: self._show_advanced_setup())
+
+        self.root.after(200, self._detect_and_show)
+
+    def _detect_and_show(self):
+        echo_mini = _detect_echo_mini()
+        for w in self._setup_btn_frame.winfo_children():
+            w.destroy()
+
+        if echo_mini:
+            self._setup_status.config(
+                text=f"Echo Mini found at {echo_mini}", fg=GREEN)
+            ttk.Button(self._setup_btn_frame, text="[ OPEN ]",
+                        style="Accent.TButton",
+                        command=lambda: self._open_with_dest(echo_mini, browse_device=True)).pack(pady=5)
+        else:
+            self._setup_status.config(
+                text="Echo Mini not detected.\nConnect your player or choose a folder.",
+                fg=FG_DIM)
+            btn_row = ttk.Frame(self._setup_btn_frame)
+            btn_row.pack()
+            ttk.Button(btn_row, text="Retry",
+                        command=self._detect_and_show).pack(side="left", padx=5)
+            ttk.Button(btn_row, text="Browse...",
+                        command=self._browse_dest).pack(side="left", padx=5)
+
+    def _browse_dest(self):
+        d = filedialog.askdirectory(title="Select destination device or folder")
+        if not d:
+            return
+        if not _is_external_path(d):
+            result = messagebox.askokcancel(
+                "Local folder selected",
+                "You selected a local folder. EchoList works best with "
+                "an external music player like Echo Mini.\n\n"
+                "Playlists created in a local folder won't be "
+                "playable on a device.\n\n"
+                "Continue anyway?")
+            if not result:
+                return
+        self._open_with_dest(d)
+
+    def _open_with_dest(self, dest, browse_device=False):
+        defaults = load_defaults()
+        source = defaults.get("source") or _default_source()
+        self._open_workspace(source, dest)
+        if browse_device:
+            self._populate_source_tree(Path(dest))
+
+    def _show_advanced_setup(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.root.config(menu=tk.Menu(self.root))
+        self._center_window(420, 280)
+
+        frame = ttk.Frame(self.root, padding=20)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="ECHOLIST", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=3, pady=(0, 15))
+
+        defaults = load_defaults()
+        cwd = str(Path.cwd())
+
+        default_source = defaults.get("source", cwd)
+        default_dest = defaults.get("dest", cwd)
+
+        ttk.Label(frame, text="SOURCE").grid(row=1, column=0, sticky="w", pady=4)
+        self._source_var = tk.StringVar(value=default_source)
+        ttk.Entry(frame, textvariable=self._source_var, width=35).grid(
+            row=1, column=1, padx=5, pady=4)
+        ttk.Button(frame, text="...", width=3,
+                    command=lambda: self._browse_var(self._source_var)).grid(row=1, column=2)
+
+        ttk.Label(frame, text="DEST").grid(row=2, column=0, sticky="w", pady=4)
+        self._dest_var = tk.StringVar(value=default_dest)
+        ttk.Entry(frame, textvariable=self._dest_var, width=35).grid(
+            row=2, column=1, padx=5, pady=4)
+        ttk.Button(frame, text="...", width=3,
+                    command=lambda: self._browse_var(self._dest_var)).grid(row=2, column=2)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=3, column=0, columnspan=3, pady=(20, 0))
+        ttk.Button(btn_row, text="Back",
+                    command=self._show_setup).pack(side="left", padx=5)
+        ttk.Button(btn_row, text="[ OPEN ]", style="Accent.TButton",
+                    command=self._on_advanced_open).pack(side="left", padx=5)
+        self.root.bind("<Return>", lambda e: self._on_advanced_open())
+
+    def _browse_var(self, var):
+        d = filedialog.askdirectory(initialdir=var.get())
+        if d:
+            var.set(d)
+
+    def _on_advanced_open(self):
+        source = self._source_var.get().strip()
+        dest = self._dest_var.get().strip()
+        if not source or not dest:
+            messagebox.showwarning("Missing paths",
+                                    "Both source and destination are required.")
+            return
+        self._open_workspace(source, dest)
+
+    def _open_workspace(self, source: str, dest: str):
+        try:
+            workspace = Path(dest) / "Playlists" / ".echolist" / "config.json"
+            if workspace.exists():
+                mgr = PlaylistManager.open(dest)
+            else:
+                mgr = PlaylistManager.init(source, dest)
+            save_defaults(source, dest)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+        self.mgr = mgr
+        self.source = source
+        self.dest = dest
+        self.root.unbind("<Return>")
+        self._show_main()
+
+    # ── Main ──
+
+    def _show_main(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+
+        self._center_window(850, 700)
+        self.root.minsize(750, 600)
+
+        # Pack status bar FIRST (side=bottom) so it never gets hidden
+        self._build_status_bar()
+
+        # Main content above status
+        main_pw = ttk.PanedWindow(self.root, orient="horizontal")
+        main_pw.pack(fill="both", expand=True, padx=4, pady=(4, 0))
+
+        # ── LEFT COLUMN ──
+        left_col = ttk.Frame(main_pw)
+        main_pw.add(left_col, weight=1)
+
+        left_pw = ttk.PanedWindow(left_col, orient="vertical")
+        left_pw.pack(fill="both", expand=True)
+
+        # Source browser
+        src_frame = ttk.Frame(left_pw)
+        left_pw.add(src_frame, weight=3)
+
+        src_header = ttk.Frame(src_frame)
+        src_header.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(src_header, text="SOURCE", style="Section.TLabel").pack(side="left")
+        ttk.Button(src_header, text="Browse...", command=self._add_files_dialog).pack(side="right")
+
+        src_tree_frame = ttk.Frame(src_frame)
+        src_tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 2))
+        self.source_tree = ttk.Treeview(src_tree_frame, selectmode="extended")
+        self.source_tree.heading("#0", text="", anchor="w")
+        src_scroll = ttk.Scrollbar(src_tree_frame, orient="vertical", command=self.source_tree.yview)
+        self.source_tree.configure(yscrollcommand=src_scroll.set)
+        self.source_tree.pack(side="left", fill="both", expand=True)
+        src_scroll.pack(side="right", fill="y")
+        self.source_tree.bind("<<TreeviewOpen>>", self._on_source_expand)
+        self.source_tree.bind("<Double-1>", self._on_source_double_click)
+
+        # Drag-and-drop bindings (add="+" so default selection still works)
+        self.source_tree.bind("<ButtonPress-1>", self._drag_start, add="+")
+        self.source_tree.bind("<B1-Motion>", self._drag_motion, add="+")
+        self.source_tree.bind("<ButtonRelease-1>", self._drag_drop, add="+")
+        self._drag_indicator = None
+
+        # Playlists
+        pl_frame = ttk.Frame(left_pw)
+        left_pw.add(pl_frame, weight=1)
+
+        pl_header = ttk.Frame(pl_frame)
+        pl_header.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(pl_header, text="PLAYLISTS", style="Section.TLabel").pack(side="left")
+        ttk.Button(pl_header, text="+ New", command=self._create_playlist).pack(side="right", padx=(4, 0))
+        ttk.Button(pl_header, text="Delete", command=self._delete_playlist).pack(side="right")
+
+        pl_tree_frame = ttk.Frame(pl_frame)
+        pl_tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.playlist_tree = ttk.Treeview(pl_tree_frame, columns=("name",), show="tree",
+                                           selectmode="browse")
+        self.playlist_tree.column("#0", width=0, stretch=False)
+        self.playlist_tree.column("name", width=200)
+        self.playlist_tree.pack(side="left", fill="both", expand=True)
+        self.playlist_tree.bind("<<TreeviewSelect>>", self._on_playlist_select)
+
+        self._rename_entry = None
+
+        # ── RIGHT COLUMN: tracks ──
+        right_col = ttk.Frame(main_pw)
+        main_pw.add(right_col, weight=2)
+
+        trk_header = ttk.Frame(right_col)
+        trk_header.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(trk_header, text="TRACKS", style="Section.TLabel").pack(side="left")
+        ttk.Button(trk_header, text="Remove", command=self._remove_track).pack(side="right")
+        self.undo_btn = ttk.Button(trk_header, text="Undo", command=self._do_undo)
+        self.undo_btn.pack(side="right", padx=(0, 4))
+        self.undo_lbl = tk.Label(trk_header, text="", font=("Consolas", 8),
+                                  bg=BG, fg=FG_DIM, anchor="w")
+        self.undo_lbl.pack(side="right", padx=(0, 4))
+
+        trk_tree_frame = ttk.Frame(right_col)
+        trk_tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 2))
+
+        cols = ("index", "title", "artist")
+        self.track_tree = ttk.Treeview(trk_tree_frame, columns=cols, show="headings",
+                                        selectmode="extended")
+        self.track_tree.heading("index", text="#", command=lambda: self._sort_tracks("index"))
+        self.track_tree.heading("title", text="TITLE", command=lambda: self._sort_tracks("title"))
+        self.track_tree.heading("artist", text="ARTIST", command=lambda: self._sort_tracks("artist"))
+        self.track_tree.column("index", width=35, minwidth=35, stretch=False)
+        self.track_tree.column("title", width=250)
+        self.track_tree.column("artist", width=160)
+
+        trk_scroll = ttk.Scrollbar(trk_tree_frame, orient="vertical", command=self.track_tree.yview)
+        self.track_tree.configure(yscrollcommand=trk_scroll.set)
+        self.track_tree.pack(side="left", fill="both", expand=True)
+        trk_scroll.pack(side="right", fill="y")
+
+        # Track tree tags for pending items
+        self.track_tree.tag_configure("pending", foreground=PENDING_FG)
+        self.track_tree.tag_configure("removed", foreground="#555555")
+
+        # Delete/Backspace on track tree removes selected tracks
+        self.track_tree.bind("<Delete>", self._remove_track)
+        self.track_tree.bind("<BackSpace>", self._remove_track)
+
+        # Drag-to-reorder on track tree
+        self._trk_drag_iid = None
+        self.track_tree.bind("<ButtonPress-1>", self._trk_drag_start, add="+")
+        self.track_tree.bind("<B1-Motion>", self._trk_drag_motion, add="+")
+        self.track_tree.bind("<ButtonRelease-1>", self._trk_drag_end, add="+")
+
+        self._build_menu()
+        self._refresh_playlists()
+        self._update_status()
+        self._refresh_expensive_stats()
+        self.root.bind("<Control-z>", lambda e: self._do_undo())
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_status_bar(self):
+        status_outer = tk.Frame(self.root, bg=BG_PANEL, bd=0)
+        status_outer.pack(fill="x", side="bottom", padx=4, pady=4)
+
+        inner = tk.Frame(status_outer, bg=BG_PANEL, padx=10, pady=8)
+        inner.pack(fill="x")
+
+        # Pending label
+        pending_row = tk.Frame(inner, bg=BG_PANEL)
+        pending_row.pack(fill="x", pady=(0, 4))
+        self.pending_lbl = tk.Label(pending_row, text="", font=("Consolas", 9),
+                                     bg=BG_PANEL, fg=PENDING_FG, anchor="center")
+        self.pending_lbl.pack(fill="x")
+
+        # SYNC row — button and progress bar share the same space
+        self.sync_frame = tk.Frame(inner, bg=BG_PANEL)
+        self.sync_frame.pack(fill="x", pady=(0, 8))
+
+        self.sync_btn = ttk.Button(self.sync_frame, text="[  S Y N C  ]", style="Sync.TButton",
+                                    command=self._do_sync)
+        self.sync_btn.pack(anchor="center", ipadx=20, ipady=4)
+
+        self.sync_progress = ttk.Progressbar(self.sync_frame, length=200, mode="determinate",
+                                              style="Sync.Horizontal.TProgressbar")
+        self.sync_status_lbl = tk.Label(self.sync_frame, text="", font=("Consolas", 9),
+                                         bg=BG_PANEL, fg=FG_DIM, anchor="center")
+        self.sync_file_bar = ttk.Progressbar(self.sync_frame, length=200, mode="determinate",
+                                              style="Yellow.Horizontal.TProgressbar")
+
+        # Stats
+        row1 = tk.Frame(inner, bg=BG_PANEL)
+        row1.pack(fill="x", pady=(0, 4))
+        self.lbl_playlists = tk.Label(row1, text="PLAYLISTS: 0", font=("Consolas", 10, "bold"),
+                                       bg=BG_PANEL, fg=FG, anchor="w")
+        self.lbl_playlists.pack(side="left")
+        self.lbl_workspace = tk.Label(row1, text="0 bytes", font=("Consolas", 9),
+                                       bg=BG_PANEL, fg=FG_DIM, anchor="e")
+        self.lbl_workspace.pack(side="right")
+
+        row2 = tk.Frame(inner, bg=BG_PANEL)
+        row2.pack(fill="x", pady=2)
+        self.lbl_tracks = tk.Label(row2, text=f"TRACKS: 0 / {MAX_TRACKS}",
+                                    font=("Consolas", 10, "bold"), bg=BG_PANEL, fg=FG, anchor="w")
+        self.lbl_tracks.pack(side="left")
+        self.track_pct_lbl = tk.Label(row2, text="0%", font=("Consolas", 9),
+                                       bg=BG_PANEL, fg=FG_DIM, anchor="e")
+        self.track_pct_lbl.pack(side="right")
+        self.track_bar = ttk.Progressbar(inner, length=200, mode="determinate",
+                                          style="Green.Horizontal.TProgressbar")
+        self.track_bar.pack(fill="x", pady=(0, 6))
+
+        row3 = tk.Frame(inner, bg=BG_PANEL)
+        row3.pack(fill="x", pady=2)
+        self.lbl_drive = tk.Label(row3, text="DRIVE: 0%", font=("Consolas", 10, "bold"),
+                                   bg=BG_PANEL, fg=FG, anchor="w")
+        self.lbl_drive.pack(side="left")
+        self.drive_pct_lbl = tk.Label(row3, text="", font=("Consolas", 9),
+                                       bg=BG_PANEL, fg=FG_DIM, anchor="e")
+        self.drive_pct_lbl.pack(side="right")
+        self.drive_bar = ttk.Progressbar(inner, length=200, mode="determinate",
+                                          style="Green.Horizontal.TProgressbar")
+        self.drive_bar.pack(fill="x")
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root, bg=BG_PANEL, fg=FG, activebackground=RED_DARK,
+                          activeforeground=FG_BRIGHT, borderwidth=0)
+        self.root.config(menu=menubar)
+        file_menu = tk.Menu(menubar, tearoff=0, bg=BG_PANEL, fg=FG,
+                            activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+        file_menu.add_command(label="Change workspace...", command=self._show_setup)
+        file_menu.add_command(label="Advanced setup...", command=self._show_advanced_setup)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+    # ── Source tree ──
+
+    def _populate_source_tree(self, root_path: Path):
+        self.source_tree.delete(*self.source_tree.get_children())
+        self._insert_children("", root_path)
+
+    def _insert_children(self, parent_iid: str, path: Path):
+        try:
+            entries = sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name.startswith(".") or entry.name.lower() in _HIDDEN_DIRS:
+                continue
+            if entry.is_file() and entry.suffix.lower() not in AUDIO_EXTS:
+                continue
+            display = entry.name + ("/" if entry.is_dir() else "")
+            iid = self.source_tree.insert(parent_iid, "end", text=display, values=(str(entry),))
+            if entry.is_dir():
+                self.source_tree.insert(iid, "end", text="...")
+
+    def _on_source_expand(self, event):
+        iid = self.source_tree.focus()
+        children = self.source_tree.get_children(iid)
+        if len(children) == 1 and self.source_tree.item(children[0], "text") == "...":
+            self.source_tree.delete(children[0])
+            path = Path(self.source_tree.item(iid, "values")[0])
+            self._insert_children(iid, path)
+
+    def _on_source_double_click(self, event):
+        iid = self.source_tree.focus()
+        if not iid:
+            return
+        values = self.source_tree.item(iid, "values")
+        if not values:
+            return
+        path = Path(values[0])
+        if path.is_file():
+            self._stage_add_files([path])
+
+    # ── Drag and drop ──
+
+    def _drag_start(self, event):
+        iid = self.source_tree.identify_row(event.y)
+        if not iid:
+            self._drag_data = None
+            return
+        # Capture selection now, before the default handler clears it to one item
+        saved = self.source_tree.selection()
+        if iid not in saved:
+            # Clicking a new item — drag just that one, not the old selection
+            saved = (iid,)
+        self._drag_data = {
+            "x": event.x_root, "y": event.y_root, "started": False,
+            "selection": saved,
+        }
+        # Restore multi-selection after the default handler deselects
+        if len(saved) > 1:
+            self.root.after_idle(lambda: self.source_tree.selection_set(saved))
+
+    def _drag_motion(self, event):
+        if not self._drag_data:
+            return
+        dx = abs(event.x_root - self._drag_data["x"])
+        dy = abs(event.y_root - self._drag_data["y"])
+        if not self._drag_data["started"] and (dx > 8 or dy > 8):
+            self._drag_data["started"] = True
+            selected = self._drag_data.get("selection", ())
+            if not selected:
+                self._drag_data = None
+                return
+            n = len(selected)
+            if self._drag_indicator:
+                self._drag_indicator.destroy()
+            self._drag_indicator = tk.Label(self.root, text=f"+ {n} file{'s' if n != 1 else ''}",
+                                             bg=RED_DARK, fg=FG_BRIGHT,
+                                             font=("Consolas", 8), padx=4, pady=2)
+
+        if self._drag_data and self._drag_data.get("started") and self._drag_indicator:
+            rx = event.x_root - self.root.winfo_rootx()
+            ry = event.y_root - self.root.winfo_rooty()
+            self._drag_indicator.place(x=rx + 14, y=ry + 14)
+            self._drag_indicator.lift()
+
+    def _drag_drop(self, event):
+        was_dragging = self._drag_data and self._drag_data.get("started")
+        saved_selection = self._drag_data.get("selection", ()) if self._drag_data else ()
+
+        if self._drag_indicator:
+            self._drag_indicator.destroy()
+            self._drag_indicator = None
+        self._drag_data = None
+
+        if not was_dragging:
+            return
+
+        # Check if dropped over the right column (tracks area or its parent)
+        rx = event.x_root
+        ry = event.y_root
+        try:
+            tx = self.track_tree.winfo_rootx()
+            ty = self.track_tree.winfo_rooty()
+            tw = self.track_tree.winfo_width()
+            th = self.track_tree.winfo_height()
+            # generous drop zone: anywhere on the right half of the window
+            win_mid = self.root.winfo_rootx() + self.root.winfo_width() // 2
+            if rx >= win_mid or (tx <= rx <= tx + tw and ty <= ry <= ty + th):
+                self._add_selected_from_source(saved_selection)
+        except Exception:
+            pass
+
+    def _add_selected_from_source(self, selected=None):
+        if not self.current_pid:
+            messagebox.showinfo("No playlist", "Select or create a playlist first.")
+            return
+        if selected is None:
+            selected = self.source_tree.selection()
+        if not selected:
+            return
+        paths = []
+        for iid in selected:
+            values = self.source_tree.item(iid, "values")
+            if values:
+                p = Path(values[0])
+                if p.is_file():
+                    paths.append(p)
+                elif p.is_dir():
+                    paths.extend(sorted(
+                        f for f in p.rglob("*")
+                        if f.is_file() and not f.name.startswith(".")
+                        and f.suffix.lower() in AUDIO_EXTS
+                    ))
+        if paths:
+            self._stage_add_files(paths)
+
+    # ── Staging operations ──
+
+    def _stage_add_files(self, paths: list[Path]):
+        if not self.current_pid:
+            messagebox.showinfo("No playlist", "Select or create a playlist first.")
+            return
+
+        # Collect existing source paths for duplicate check
+        existing = set()
+        source_root = Path(self.mgr.config.source_root)
+        playlist = self.mgr.store.playlists.get(self.current_pid, {})
+        for t in playlist.get("tracks", []):
+            sp = Path(t.get("src_path", ""))
+            if not sp.is_absolute():
+                sp = source_root / sp
+            existing.add(str(sp.resolve()))
+        for a in self.staging.pending_adds:
+            if a["pid"] == self.current_pid:
+                existing.add(str(Path(a["src"]).resolve()))
+
+        added_indices = []
+        skipped = []
+        for p in paths:
+            resolved = str(p.resolve())
+            if resolved in existing:
+                skipped.append(p.name)
+                continue
+            existing.add(resolved)
+            title, artist = _read_tags_from_file(p)
+            self.staging.stage_add(self.current_pid, str(p), title, artist)
+            added_indices.append(len(self.staging.pending_adds) - 1)
+
+        if added_indices:
+            n = len(added_indices)
+            self._undo_stack.append({
+                "type": "add",
+                "indices": added_indices,
+                "desc": f"Add {n} track{'s' if n != 1 else ''} to {self.current_pid}",
+            })
+        if skipped:
+            messagebox.showinfo("Duplicates skipped",
+                                f"{len(skipped)} track(s) already in playlist:\n" +
+                                "\n".join(skipped[:10]))
+        self._refresh_tracks()
+        self._update_status()
+
+    def _stage_remove_track(self, pid: str, index: int, copy_name: str):
+        self.staging.stage_remove(pid, index, copy_name)
+        self._undo_stack.append({
+            "type": "remove",
+            "desc": f"Remove #{index} from {pid}",
+        })
+        self._refresh_tracks()
+        self._update_status()
+
+    def _do_undo(self):
+        if not self._undo_stack:
+            return
+        action = self._undo_stack.pop()
+
+        if action["type"] == "add":
+            for i in sorted(action["indices"], reverse=True):
+                if i < len(self.staging.pending_adds):
+                    self.staging.pending_adds.pop(i)
+            self.staging.save()
+        elif action["type"] == "remove":
+            n = action.get("count", 1)
+            for _ in range(n):
+                if self.staging.pending_removes:
+                    self.staging.pending_removes.pop()
+            self.staging.save()
+        elif action["type"] == "unstage_add":
+            pass  # can't re-add unstaged items
+        elif action["type"] == "reorder":
+            pid = action.get("pid", "")
+            if pid in self.staging.pending_reorders:
+                del self.staging.pending_reorders[pid]
+                self.staging.save()
+
+        self._refresh_tracks()
+        self._update_status()
+
+    def _on_close(self):
+        if self.staging and self.staging.has_pending:
+            n = self.staging.total_ops
+            result = messagebox.askyesnocancel(
+                "Unsaved changes",
+                f"You have {n} pending change{'s' if n != 1 else ''}.\n\n"
+                "Yes = Sync now, then exit\n"
+                "No = Exit (changes are saved, sync next time)\n"
+                "Cancel = Stay",
+            )
+            if result is None:
+                return
+            if result:
+                self._do_sync_blocking()
+        self._alive = False
+        t = getattr(self, "_stats_thread", None)
+        if t:
+            t.join(timeout=5)
+        self.root.destroy()
+
+    def _do_sync_blocking(self):
+        """Synchronous sync for use during close."""
+        for r in sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True):
+            try:
+                self.mgr.remove_track(r["pid"], r["index"])
+            except Exception:
+                pass
+        for a in list(self.staging.pending_adds):
+            try:
+                self.mgr.add_track(a["pid"], a["src"])
+            except Exception:
+                pass
+        self._apply_reorders()
+        self.staging.clear()
+        self._undo_stack.clear()
+
+    def _apply_reorders(self):
+        """Re-tag and rename committed tracks to match the staged reorder."""
+        from .tags import apply_playlist_tags
+        from .naming import track_filename
+        import mutagen
+
+        for pid, order in self.staging.pending_reorders.items():
+            if pid not in self.mgr.store.playlists:
+                continue
+            playlist = self.mgr.store.playlists[pid]
+            folder = playlist["folder"]
+
+            committed_by_key = {}
+            for t in playlist["tracks"]:
+                committed_by_key[f"c:{t['index']}"] = t
+
+            # Build the new order with new indices
+            reorder_plan = []
+            new_idx = 1
+            for entry in order:
+                key = entry["key"]
+                if key in committed_by_key:
+                    t = committed_by_key[key]
+                    old_name = t["copy_name"]
+                    # Read title from the file to build the new name
+                    title = t.get("copy_name", "").split(" - ", 1)[-1].rsplit(".", 1)[0]
+                    try:
+                        m = mutagen.File(self.mgr.writer.root / folder / old_name, easy=True)
+                        if m and "title" in m:
+                            title = m["title"][0]
+                    except Exception:
+                        pass
+                    ext = Path(old_name).suffix
+                    pad = 3 if len(order) > 99 else 2
+                    new_name = track_filename(new_idx, title, ext, pad)
+                    reorder_plan.append((t, new_idx, old_name, new_name))
+                    new_idx += 1
+
+            # Also pick up any tracks not in the reorder list
+            for t in playlist["tracks"]:
+                key = f"c:{t['index']}"
+                if key in committed_by_key and t not in [r[0] for r in reorder_plan]:
+                    old_name = t["copy_name"]
+                    ext = Path(old_name).suffix
+                    title = old_name.split(" - ", 1)[-1].rsplit(".", 1)[0]
+                    pad = 3 if len(order) > 99 else 2
+                    new_name = track_filename(new_idx, title, ext, pad)
+                    reorder_plan.append((t, new_idx, old_name, new_name))
+                    new_idx += 1
+
+            # Two-pass rename to avoid collisions
+            # Pass 1: rename to temporary names
+            temp_names = []
+            for t, idx, old_name, new_name in reorder_plan:
+                if old_name != new_name:
+                    tmp_name = f"_echolist_tmp_{idx}_{old_name}"
+                    old_rel = f"{folder}/{old_name}"
+                    tmp_rel = f"{folder}/{tmp_name}"
+                    try:
+                        self.mgr.writer.rename(old_rel, tmp_rel)
+                    except Exception:
+                        pass
+                    temp_names.append((t, idx, tmp_name, new_name))
+                else:
+                    temp_names.append((t, idx, old_name, new_name))
+
+            # Pass 2: rename from temp to final
+            for t, idx, current_name, new_name in temp_names:
+                if current_name != new_name:
+                    tmp_rel = f"{folder}/{current_name}"
+                    new_rel = f"{folder}/{new_name}"
+                    try:
+                        self.mgr.writer.rename(tmp_rel, new_rel)
+                    except Exception:
+                        pass
+
+            # Update store and re-tag
+            new_tracks = []
+            for t, idx, old_name, new_name in reorder_plan:
+                t["index"] = idx
+                t["copy_name"] = new_name
+                try:
+                    path = self.mgr.writer.resolve(f"{folder}/{new_name}")
+                    album = self.mgr.config.album_prefix + playlist["name"]
+                    apply_playlist_tags(
+                        path, self.mgr.config.node_name, album,
+                        idx, t.get("src_path", ""), pid,
+                    )
+                except Exception:
+                    pass
+                new_tracks.append(t)
+
+            playlist["tracks"] = new_tracks
+            self.mgr.store.save()
+
+    # ── SYNC ──
+
+    def _do_sync(self):
+        if not self.staging.has_pending:
+            return
+
+        total = self.staging.total_ops
+
+        # Swap button for progress bars
+        self.sync_btn.pack_forget()
+        self.sync_status_lbl.pack(fill="x")
+        self.sync_progress.pack(fill="x", pady=(2, 0))
+        self.sync_file_bar.pack(fill="x", pady=(2, 0))
+        self.sync_progress["maximum"] = total
+        self.sync_progress["value"] = 0
+        self.sync_file_bar["maximum"] = 100
+        self.sync_file_bar["value"] = 0
+
+        adds = list(self.staging.pending_adds)
+        removes = sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True)
+
+        def worker():
+            done = 0
+            errors = []
+
+            for r in removes:
+                done += 1
+                self.root.after(0, lambda d=done: _update_progress(d, "Removing..."))
+                try:
+                    self.mgr.remove_track(r["pid"], r["index"])
+                except Exception as e:
+                    errors.append(f"Remove #{r['index']}: {e}")
+
+            for i, a in enumerate(adds):
+                done += 1
+                title = a.get("title", Path(a["src"]).stem)
+                self.root.after(0, lambda d=done, t=title: _update_progress(d, t))
+                self.root.after(0, lambda: _update_file_progress(0))
+
+                def on_copy_progress(copied, file_total):
+                    pct = int(copied / file_total * 100) if file_total else 100
+                    self.root.after(0, lambda p=pct: _update_file_progress(p))
+
+                try:
+                    self.mgr.add_track(a["pid"], a["src"], progress_cb=on_copy_progress)
+                except Exception as e:
+                    errors.append(f"{Path(a['src']).name}: {e}")
+                self.root.after(0, lambda: _update_file_progress(100))
+
+            self._apply_reorders()
+            self.root.after(0, lambda: _finish(errors))
+
+        def _update_progress(done, label=""):
+            self.sync_progress["value"] = done
+            self.sync_status_lbl.config(text=f"Syncing {done}/{total}  {label}")
+
+        def _update_file_progress(pct):
+            self.sync_file_bar["value"] = pct
+
+        def _finish(errors):
+            self.staging.clear()
+            self._undo_stack.clear()
+            self.sync_progress.pack_forget()
+            self.sync_status_lbl.pack_forget()
+            self.sync_file_bar.pack_forget()
+            self.sync_btn.pack(anchor="center", ipadx=20, ipady=4)
+            self._refresh_playlists()
+            self._update_status()
+            self._refresh_expensive_stats()
+            if errors:
+                messagebox.showwarning("Sync errors",
+                                        f"Completed with errors:\n" + "\n".join(errors[:15]))
+            else:
+                self.pending_lbl.config(text="  ✓ Sync complete", fg=GREEN)
+                self.root.after(4000, lambda: self.pending_lbl.config(text="", fg=PENDING_FG))
+
+        Thread(target=worker, daemon=True).start()
+
+    # ── Playlists ──
+
+    def _refresh_playlists(self):
+        self.playlist_tree.delete(*self.playlist_tree.get_children())
+        for pid, pl in self.mgr.store.playlists.items():
+            self.playlist_tree.insert("", "end", iid=pid, values=(pl["name"],))
+        children = self.playlist_tree.get_children()
+        if children:
+            if self.current_pid and self.current_pid in children:
+                self.playlist_tree.selection_set(self.current_pid)
+            else:
+                self.playlist_tree.selection_set(children[0])
+            self._on_playlist_select(None)
+
+    def _on_playlist_select(self, event):
+        sel = self.playlist_tree.selection()
+        if not sel:
+            self.current_pid = None
+            self.track_tree.delete(*self.track_tree.get_children())
+            return
+        self.current_pid = sel[0]
+        self._refresh_tracks()
+
+    def _create_playlist(self):
+        temp_name = "New Playlist"
+        try:
+            pid = self.mgr.create_playlist(temp_name)
+        except ValueError:
+            n = 2
+            while True:
+                try:
+                    temp_name = f"New Playlist {n}"
+                    pid = self.mgr.create_playlist(temp_name)
+                    break
+                except ValueError:
+                    n += 1
+                    if n > 100:
+                        messagebox.showerror("Error", "Could not create playlist.")
+                        return
+
+        self._refresh_playlists()
+        self._update_status()
+        self.playlist_tree.selection_set(pid)
+        self.playlist_tree.see(pid)
+        self.current_pid = pid
+        self._refresh_tracks()
+        self.root.after(50, lambda: self._start_inline_rename(pid))
+
+    def _start_inline_rename(self, pid):
+        self.playlist_tree.update_idletasks()
+        try:
+            bbox = self.playlist_tree.bbox(pid, column="name")
+        except Exception:
+            return
+        if not bbox:
+            return
+
+        x, y, w, h = bbox
+        entry = tk.Entry(self.playlist_tree, bg=BG_INPUT, fg=FG_BRIGHT,
+                         insertbackground=FG_BRIGHT, font=("Consolas", 9),
+                         relief="flat", highlightthickness=1, highlightcolor=RED)
+        entry.place(x=x, y=y, width=w, height=h)
+
+        current_name = self.mgr.store.playlists[pid]["name"]
+        entry.insert(0, current_name)
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        def commit(event=None):
+            new_name = entry.get().strip()
+            entry.destroy()
+            self._rename_entry = None
+            if not new_name or new_name == current_name:
+                return
+            new_pid = playlist_id(new_name)
+            if new_pid != pid and new_pid in self.mgr.store.playlists:
+                messagebox.showerror("Error", f"Playlist '{new_name}' already exists.")
+                return
+            pl = self.mgr.store.playlists[pid]
+            old_folder = pl["folder"]
+            new_folder = sanitize(new_name)
+            pl["name"] = new_name
+            pl["folder"] = new_folder
+            if new_pid != pid:
+                self.mgr.store.playlists[new_pid] = pl
+                del self.mgr.store.playlists[pid]
+                self.current_pid = new_pid
+            if old_folder != new_folder:
+                try:
+                    self.mgr.writer.rename(old_folder, new_folder)
+                except Exception:
+                    pass
+            self.mgr.store.save()
+            self._refresh_playlists()
+            self._update_status()
+
+        def cancel(event=None):
+            entry.destroy()
+            self._rename_entry = None
+
+        entry.bind("<Return>", commit)
+        entry.bind("<Escape>", cancel)
+        entry.bind("<FocusOut>", commit)
+        self._rename_entry = entry
+
+    def _delete_playlist(self):
+        if not self.current_pid:
+            return
+        pl = self.mgr.store.playlists.get(self.current_pid)
+        if not pl:
+            return
+        if not messagebox.askyesno("Delete playlist",
+                                   f"Delete playlist '{pl['name']}'?\n\n"
+                                   "This will remove the playlist folder and all the\n"
+                                   "tracks that were copied into it.\n"
+                                   "Your original music files are never touched."):
+            return
+        try:
+            self.mgr.writer.delete(pl["folder"])
+        except Exception:
+            pass
+        del self.mgr.store.playlists[self.current_pid]
+        self.mgr.store.save()
+        self.current_pid = None
+        self._refresh_playlists()
+        self._update_status()
+
+    # ── Tracks ──
+
+    def _refresh_tracks(self):
+        self.track_tree.delete(*self.track_tree.get_children())
+        if not self.current_pid or self.current_pid not in self.mgr.store.playlists:
+            self._track_data = []
+            self._removed_data = []
+            return
+        playlist = self.mgr.store.playlists[self.current_pid]
+        active, removed = self.staging.virtual_tracks(self.current_pid, playlist["tracks"])
+
+        self._track_data = []
+        for t in active:
+            if t.get("_pending"):
+                title = t.get("title", "")
+                artist = t.get("artist", "")
+            else:
+                title, artist = self._read_track_tags(
+                    playlist["folder"], t.get("copy_name", ""), t.get("src_path", "")
+                )
+            self._track_data.append({
+                "index": t["index"],
+                "title": title,
+                "artist": artist,
+                "pending": t.get("_pending", False),
+                "copy_name": t.get("copy_name", ""),
+                "key": t.get("_key", ""),
+            })
+
+        self._removed_data = []
+        for t in removed:
+            title, artist = self._read_track_tags(
+                playlist["folder"], t.get("copy_name", ""), t.get("src_path", "")
+            )
+            self._removed_data.append({
+                "index": t["index"],
+                "title": title,
+                "artist": artist,
+                "copy_name": t.get("copy_name", ""),
+                "key": t.get("_key", ""),
+            })
+
+        self._display_tracks()
+
+    def _display_tracks(self):
+        self.track_tree.delete(*self.track_tree.get_children())
+        for row in self._track_data:
+            tag = ("pending",) if row["pending"] else ()
+            prefix = "~ " if row["pending"] else ""
+            self.track_tree.insert("", "end", values=(row["index"], prefix + row["title"], row["artist"]),
+                                    tags=tag)
+        for row in self._removed_data:
+            self.track_tree.insert("", "end",
+                                    values=(row["index"], row["title"], row["artist"]),
+                                    tags=("removed",))
+
+    def _sort_tracks(self, col):
+        if self._sort_col == col:
+            if self._sort_reverse:
+                self._sort_col = None
+                self._sort_reverse = False
+                self._track_data.sort(key=lambda r: r["index"])
+                self._display_tracks()
+                for c in ("index", "title", "artist"):
+                    label = {"index": "#", "title": "TITLE", "artist": "ARTIST"}[c]
+                    self.track_tree.heading(c, text=label)
+                return
+            else:
+                self._sort_reverse = True
+        else:
+            self._sort_col = col
+            self._sort_reverse = False
+
+        def sort_key(row):
+            val = row[col]
+            if col == "index":
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    return 0
+            return str(val).lower()
+
+        self._track_data.sort(key=sort_key, reverse=self._sort_reverse)
+        self._display_tracks()
+
+        arrow = " ▼" if self._sort_reverse else " ▲"
+        for c in ("index", "title", "artist"):
+            label = {"index": "#", "title": "TITLE", "artist": "ARTIST"}[c]
+            self.track_tree.heading(c, text=label + (arrow if c == col else ""))
+
+    # ── Track reorder drag ──
+
+    def _trk_drag_start(self, event):
+        iid = self.track_tree.identify_row(event.y)
+        region = self.track_tree.identify_region(event.x, event.y)
+        if region == "heading":
+            self._trk_drag_iid = None
+            return
+        self._trk_drag_iid = iid
+        self._trk_drag_origin_y = event.y
+
+    def _trk_drag_motion(self, event):
+        if not self._trk_drag_iid:
+            return
+        if abs(event.y - self._trk_drag_origin_y) < 5:
+            return
+        target = self.track_tree.identify_row(event.y)
+        if target and target != self._trk_drag_iid:
+            try:
+                bbox = self.track_tree.bbox(target)
+            except Exception:
+                return
+            if not bbox:
+                return
+            mid = bbox[1] + bbox[3] // 2
+            if event.y < mid:
+                pos = self.track_tree.index(target)
+            else:
+                pos = self.track_tree.index(target) + 1
+            self.track_tree.move(self._trk_drag_iid, "", pos)
+
+    def _trk_drag_end(self, event):
+        if not self._trk_drag_iid:
+            return
+        self._trk_drag_iid = None
+
+        # Read new order from tree, rebuild _track_data and save reorder
+        all_iids = self.track_tree.get_children()
+        if not all_iids or not self._track_data or not self.current_pid:
+            return
+
+        # Build a map from displayed values to track_data row
+        old_data = list(self._track_data)
+
+        # Map tree row positions to old _track_data entries by matching display values
+        # Since display may have been sorted, we match by the current tree content
+        old_by_display = {}
+        for row in old_data:
+            prefix = "~ " if row["pending"] else ""
+            disp_key = (str(row["index"]), prefix + row["title"], row["artist"])
+            old_by_display[disp_key] = row
+
+        new_order = []
+        for iid in all_iids:
+            vals = self.track_tree.item(iid, "values")
+            disp_key = (str(vals[0]), str(vals[1]), str(vals[2]))
+            if disp_key in old_by_display:
+                new_order.append(old_by_display[disp_key])
+
+        if len(new_order) != len(old_data):
+            return
+
+        # Check if order actually changed
+        if all(n["key"] == o["key"] for n, o in zip(new_order, old_data)):
+            return
+
+        # Renumber indices
+        for i, row in enumerate(new_order, 1):
+            row["index"] = i
+
+        self._track_data = new_order
+        self._display_tracks()
+
+        # Save reorder to staging
+        reorder_list = [{"key": row["key"]} for row in new_order]
+        self.staging.set_reorder(self.current_pid, reorder_list)
+
+        self._undo_stack.append({
+            "type": "reorder",
+            "pid": self.current_pid,
+            "desc": f"Reorder tracks in {self.current_pid}",
+        })
+        self._update_status()
+
+    def _read_track_tags(self, folder: str, copy_name: str, src_path: str = "") -> tuple[str, str]:
+        # Try the copy first
+        if copy_name:
+            try:
+                import mutagen
+                path = self.mgr.writer.root / folder / copy_name
+                m = mutagen.File(path, easy=True)
+                if m:
+                    title = m.get("title", [""])[0]
+                    artist = m.get("artist", [""])[0]
+                    if title or artist:
+                        return title, artist
+            except Exception:
+                pass
+
+        # Fallback: read from original source
+        if src_path:
+            source_root = Path(self.mgr.config.source_root)
+            src_full = source_root / src_path if not Path(src_path).is_absolute() else Path(src_path)
+            if src_full.exists():
+                return _read_tags_from_file(src_full)
+
+        return copy_name or "", ""
+
+    def _remove_track(self, event=None):
+        if not self.current_pid:
+            return
+        selected = self.track_tree.selection()
+        if not selected:
+            return
+
+        all_iids = self.track_tree.get_children()
+        selected_rows = []
+        for iid in selected:
+            row_idx = all_iids.index(iid)
+            if row_idx < len(self._track_data):
+                selected_rows.append(self._track_data[row_idx])
+
+        pending_keys = []
+        committed_keys = []
+        for row in selected_rows:
+            if row["pending"]:
+                pending_keys.append(row["key"])
+            else:
+                committed_keys.append(row["key"])
+
+        if pending_keys:
+            pending_offsets = set()
+            for k in pending_keys:
+                # key format is "p:N"
+                pending_offsets.add(int(k.split(":")[1]))
+            indices_to_pop = []
+            count = 0
+            for i, a in enumerate(self.staging.pending_adds):
+                if a["pid"] == self.current_pid:
+                    if count in pending_offsets:
+                        indices_to_pop.append(i)
+                    count += 1
+            for i in sorted(indices_to_pop, reverse=True):
+                self.staging.pending_adds.pop(i)
+            self.staging.save()
+            self._undo_stack.append({
+                "type": "unstage_add",
+                "desc": f"Remove {len(indices_to_pop)} pending track(s)",
+            })
+
+        if committed_keys:
+            playlist = self.mgr.store.playlists[self.current_pid]
+            for k in committed_keys:
+                orig_idx = int(k.split(":")[1])
+                copy_name = ""
+                for t in playlist["tracks"]:
+                    if t["index"] == orig_idx:
+                        copy_name = t["copy_name"]
+                        break
+                self.staging.stage_remove(self.current_pid, orig_idx, copy_name)
+            self._undo_stack.append({
+                "type": "remove",
+                "count": len(committed_keys),
+                "desc": f"Remove {len(committed_keys)} track(s) from {self.current_pid}",
+            })
+
+        # Clear reorder for this playlist since indices changed
+        if self.current_pid in self.staging.pending_reorders:
+            del self.staging.pending_reorders[self.current_pid]
+            self.staging.save()
+
+        self._refresh_tracks()
+        self._update_status()
+
+    def _add_files_dialog(self):
+        folder = filedialog.askdirectory(
+            title="Add folder to source browser",
+            initialdir=self.source,
+        )
+        if not folder:
+            return
+        folder_path = Path(folder)
+        display = folder_path.name + "/"
+        iid = self.source_tree.insert("", "end", text=display, values=(str(folder_path),))
+        self.source_tree.insert(iid, "end", text="...")
+
+    # ── Status ──
+
+    def _refresh_expensive_stats(self):
+        if self._stats_pending:
+            return
+        self._stats_pending = True
+
+        def worker():
+            try:
+                dt, wb = self.mgr.compute_expensive_stats()
+            except Exception:
+                dt, wb = 0, 0
+            if self._alive:
+                try:
+                    self.root.after(0, lambda: self._on_expensive_stats(dt, wb))
+                except RuntimeError:
+                    pass
+
+        t = Thread(target=worker, daemon=True)
+        t.start()
+        self._stats_thread = t
+
+    def _on_expensive_stats(self, device_tracks, workspace_bytes):
+        self._cached_device_tracks = device_tracks
+        self._cached_workspace_bytes = workspace_bytes
+        self._stats_pending = False
+        self._update_status()
+
+    def _update_status(self):
+        try:
+            s = self.mgr.stats(
+                cached_device_tracks=self._cached_device_tracks,
+                cached_workspace_bytes=self._cached_workspace_bytes,
+            )
+        except Exception:
+            return
+
+        self.lbl_playlists.config(text=f"PLAYLISTS: {s['playlists']}")
+        self.lbl_workspace.config(text=f"{s['workspace_bytes']:,} bytes")
+
+        pending_delta = len(self.staging.pending_adds) - len(self.staging.pending_removes)
+        virtual_count = s.get("device_tracks", 0) + pending_delta
+        track_pct = round(virtual_count / MAX_TRACKS * 100, 1)
+        self.lbl_tracks.config(text=f"TRACKS: {virtual_count} / {MAX_TRACKS}")
+        self.track_pct_lbl.config(text=f"{track_pct}%")
+        self.track_bar["value"] = track_pct
+        self._color_bar(self.track_bar, track_pct)
+        self.lbl_tracks.config(fg=RED_BRIGHT if track_pct >= 90 else FG)
+
+        drive_pct = s["drive_used_pct"]
+        self.lbl_drive.config(text=f"DRIVE: {drive_pct}%")
+        self.drive_bar["value"] = drive_pct
+        self._color_bar(self.drive_bar, drive_pct)
+        self.lbl_drive.config(fg=RED_BRIGHT if drive_pct >= 90 else FG)
+
+        if self.staging.has_pending:
+            n = self.staging.total_ops
+            self.pending_lbl.config(text=f"{n} pending change{'s' if n != 1 else ''}")
+        else:
+            self.pending_lbl.config(text="")
+
+        if self._undo_stack:
+            self.undo_btn.state(["!disabled"])
+            self.undo_lbl.config(text=self._undo_stack[-1]["desc"])
+        else:
+            self.undo_btn.state(["disabled"])
+            self.undo_lbl.config(text="")
+
+    def _color_bar(self, bar, pct):
+        if pct >= 90:
+            bar.configure(style="Red.Horizontal.TProgressbar")
+        elif pct >= 70:
+            bar.configure(style="Yellow.Horizontal.TProgressbar")
+        else:
+            bar.configure(style="Green.Horizontal.TProgressbar")
+
+
+def run():
+    signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+    app = App()
+    app.run()
+
+
+if __name__ == "__main__":
+    run()

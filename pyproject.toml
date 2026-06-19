@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echolist"
+version = "0.1.0"
+description = "Playlist manager for SnowSky Echo Mini"
+requires-python = ">=3.9"
+dependencies = [
+    "mutagen",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["echolist"]
+
+[project.scripts]
+echolist = "echolist.gui:run"

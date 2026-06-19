@@ -1,0 +1,73 @@
+name: Build & Release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: echolist-windows
+            exe: echolist.exe
+          - os: ubuntu-latest
+            artifact: echolist-linux
+            exe: echolist
+          - os: macos-latest
+            artifact: echolist-macos-arm64
+            exe: echolist
+          # - os: macos-13
+          #   artifact: echolist-macos-intel
+          #   exe: echolist
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller mutagen pillow
+      - name: Build executable
+        shell: bash
+        run: |
+          SEP=":"
+          if [ "$RUNNER_OS" = "Windows" ]; then SEP=";"; fi
+          pyinstaller --onefile --name echolist --windowed \
+            --icon echolist/echolist.ico \
+            --add-data "echolist/echolist.ico${SEP}echolist" \
+            --add-data "echolist/echolist.png${SEP}echolist" \
+            --add-data "docs${SEP}docs" \
+            echolist/__main__.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.exe }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Rename binaries
+        run: |
+          mv artifacts/echolist-windows/echolist.exe artifacts/echolist-windows.exe
+          cp artifacts/echolist-linux/echolist artifacts/echolist-linux.bin
+          rm -rf artifacts/echolist-linux
+          mv artifacts/echolist-linux.bin artifacts/echolist-linux
+          cp artifacts/echolist-macos-arm64/echolist artifacts/echolist-macos-arm64.bin
+          rm -rf artifacts/echolist-macos-arm64
+          mv artifacts/echolist-macos-arm64.bin artifacts/echolist-macos-arm64
+          # cp artifacts/echolist-macos-intel/echolist artifacts/echolist-macos-intel.bin
+          # rm -rf artifacts/echolist-macos-intel
+          # mv artifacts/echolist-macos-intel.bin artifacts/echolist-macos-intel
+          chmod +x artifacts/echolist-linux artifacts/echolist-macos-arm64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/echolist-windows.exe
+            artifacts/echolist-linux
+            artifacts/echolist-macos-arm64
+          generate_release_notes: true
