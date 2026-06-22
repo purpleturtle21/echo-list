@@ -227,9 +227,9 @@ class PlaylistManager:
 
         source_root = Path(self.config.source_root).resolve()
         try:
-            src_rel = str(src.relative_to(source_root))
+            src_rel = src.relative_to(source_root).as_posix()
         except ValueError:
-            src_rel = str(src)
+            src_rel = src.as_posix()
 
         title = _read_title(src)
         ext = src.suffix

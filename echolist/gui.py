@@ -122,7 +122,7 @@ def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
     """
     if not src_path:
         return None
-    p = Path(src_path)
+    p = Path(src_path.replace("\\", "/"))
 
     # 1. Relative to source_root
     if not p.is_absolute():

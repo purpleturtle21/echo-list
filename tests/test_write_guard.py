@@ -62,7 +62,8 @@ ALLOWED_EXCEPTIONS = {
     "cli.py": {"mkdir", "write_text"},
     # gui.py writes ~/.echolist/pending.json (user-local staging state);
     # .save() calls are on Store/Staging wrapper objects, not direct disk writes
-    "gui.py": {"mkdir", "write_text", "unlink", "rename", "save"},
+    # .replace() is str.replace for path separator normalization, not Path.replace
+    "gui.py": {"mkdir", "write_text", "unlink", "rename", "save", "replace"},
     # manager.py uses SafeWriter.rename via self.writer — and open() for hashing;
     # .save() calls are on Store/Config wrapper objects, not mutagen
     "manager.py": {"rename", "mkdir", "save"},
