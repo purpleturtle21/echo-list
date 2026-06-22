@@ -2622,12 +2622,17 @@ class App:
         pl = self.mgr.store.playlists.get(self.current_pid)
         if not pl:
             return
+        orphans = [t for t in pl.get("tracks", []) if not t.get("src_path")]
+        warning = ""
+        if orphans:
+            warning = (f"\n\n{len(orphans)} track(s) have no source file "
+                       f"(e.g. from an adopted folder) and cannot be restored.")
         if not messagebox.askyesno("Delete playlist",
                                    f"Delete playlist '{pl['name']}'?\n\n"
                                    "This will remove the playlist folder and all the\n"
                                    "tracks that were copied into it.\n"
                                    "Your original music files are never touched.\n\n"
-                                   "A restore point will be saved so you can bring it back."):
+                                   f"A restore point will be saved so you can bring it back.{warning}"):
             return
         pid = self.current_pid
         name = pl["name"]
