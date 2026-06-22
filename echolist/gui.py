@@ -987,7 +987,7 @@ class App:
         self.root.bind("<Control-z>", lambda e: self._do_undo())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        source_root = Path(self.mgr.config.source_root)
+        source_root = Path(self.mgr.config.source_root).resolve()
         if source_root.exists():
             self._populate_source_tree(source_root)
 
@@ -1196,7 +1196,7 @@ class App:
             return self.mgr.restore_playlist_to_point(pid, timestamp)
 
         def on_done(result):
-            source_root = Path(self.mgr.config.source_root)
+            source_root = Path(self.mgr.config.source_root).resolve()
             missing = []
             for s in result["to_stage"]:
                 src_path = s["src_path"]
@@ -1253,7 +1253,7 @@ class App:
             return self.mgr.restore_deleted_playlist(pid, timestamp)
 
         def on_done(sources):
-            source_root = Path(self.mgr.config.source_root)
+            source_root = Path(self.mgr.config.source_root).resolve()
             missing = []
             for s in sources:
                 src_path = s["src_path"]
@@ -1347,7 +1347,7 @@ class App:
         self._src_search_entry.delete(0, "end")
         self._src_search_show_placeholder()
         self.root.focus_set()
-        source_root = Path(self.mgr.config.source_root)
+        source_root = Path(self.mgr.config.source_root).resolve()
         if source_root.exists():
             self._populate_source_tree(source_root)
 
@@ -1362,11 +1362,11 @@ class App:
         self._src_search_after_id = None
         query = self._src_search_var.get().strip().lower()
         if not query:
-            source_root = Path(self.mgr.config.source_root)
+            source_root = Path(self.mgr.config.source_root).resolve()
             if source_root.exists():
                 self._populate_source_tree(source_root)
             return
-        source_root = Path(self.mgr.config.source_root)
+        source_root = Path(self.mgr.config.source_root).resolve()
         if not source_root.exists():
             return
         self.source_tree.delete(*self.source_tree.get_children())
@@ -1431,7 +1431,7 @@ class App:
     def _show_track_in_source(self, src_path: str):
         if not src_path:
             return
-        source_root = Path(self.mgr.config.source_root).resolve()
+        source_root = Path(self.mgr.config.source_root).resolve().resolve()
         full = _resolve_source_file(src_path, source_root)
         if not full:
             messagebox.showinfo("Not found", f"Source file not found:\n{src_path}")
@@ -1629,7 +1629,7 @@ class App:
                 pass
 
             # Stage all tracks for re-copying from source
-            source_root = Path(self.mgr.config.source_root)
+            source_root = Path(self.mgr.config.source_root).resolve()
             staged = 0
             missing = []
             for entry in tracks:
@@ -1774,7 +1774,7 @@ class App:
 
         # Collect existing source paths for duplicate check
         existing = set()
-        source_root = Path(self.mgr.config.source_root)
+        source_root = Path(self.mgr.config.source_root).resolve()
         playlist = self.mgr.store.playlists.get(self.current_pid, {})
         for t in playlist.get("tracks", []):
             sp = Path(t.get("src_path", ""))
@@ -2132,7 +2132,7 @@ class App:
         """Reload source tree, playlists, tracks, and stats."""
         if self._syncing:
             return
-        source_root = Path(self.mgr.config.source_root)
+        source_root = Path(self.mgr.config.source_root).resolve()
         if source_root.exists():
             self._populate_source_tree(source_root)
         for pid in list(self.mgr.store.playlists):
@@ -2499,7 +2499,7 @@ class App:
 
     def _import_m3u_file(self, m3u_path: Path):
         """Parse one .m3u file, create a playlist, and stage found tracks."""
-        source_root = Path(self.mgr.config.source_root)
+        source_root = Path(self.mgr.config.source_root).resolve()
         result = parse_m3u(m3u_path, source_root=source_root)
 
         existing_pids = set(self.mgr.store.playlists.keys())
@@ -2949,7 +2949,7 @@ class App:
                 pass
 
         if src_path:
-            source_root = Path(self.mgr.config.source_root)
+            source_root = Path(self.mgr.config.source_root).resolve()
             src_full = _resolve_source_file(src_path, source_root)
             if src_full:
                 result = _read_tags_from_file(src_full)

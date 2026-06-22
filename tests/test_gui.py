@@ -1093,6 +1093,44 @@ class TestPlaylistStatusIcons:
         assert app._playlist_status_icon(pid, pl) == "◌"
 
 
+class TestDeletePlaylist:
+    """Test playlist deletion with orphan track warnings."""
+
+    def test_delete_orphan_tracks_warns(self, app, gui_env):
+        """Deleting a playlist with sourceless tracks includes a warning."""
+        app._create_playlist()
+        pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        # Simulate an adopted track (no src_path)
+        pl = app.mgr.store.playlists[pid]
+        pl["tracks"][0]["src_path"] = ""
+
+        with patch("echolist.gui.messagebox.askyesno", return_value=False) as mock:
+            app._delete_playlist()
+        call_text = mock.call_args[1].get("message", mock.call_args[0][1])
+        assert "no source file" in call_text.lower() or "cannot be restored" in call_text.lower()
+        # Playlist should still exist since user said no
+        assert pid in app.mgr.store.playlists
+
+    def test_delete_normal_playlist_no_orphan_warning(self, app, gui_env):
+        """Deleting a playlist with all source tracks shows no orphan warning."""
+        app._create_playlist()
+        pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        with patch("echolist.gui.messagebox.askyesno", return_value=False) as mock:
+            app._delete_playlist()
+        call_text = mock.call_args[1].get("message", mock.call_args[0][1])
+        assert "cannot be restored" not in call_text.lower()
+
+
 class TestOffloadOnload:
     """Test playlist offload/onload lifecycle."""
 
@@ -1258,6 +1296,48 @@ class TestTrackContextMenu:
         with patch("echolist.gui.messagebox.showinfo") as mock:
             app._show_track_in_source("nonexistent/file.flac")
         mock.assert_called_once()
+
+    def test_show_in_source_lazy_loads_unexpanded_folder(self, app, gui_env):
+        """Show in source must expand lazy-loaded folders to reach the file."""
+        app._create_playlist()
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+        app._refresh_tracks()
+        _flush_tracks(app)
+
+        # Collapse all tree nodes to simulate unexpanded state
+        for iid in app.source_tree.get_children():
+            app.source_tree.item(iid, open=False)
+
+        src_rel = app._track_data[0]["src_path"]
+        app._show_track_in_source(src_rel)
+
+        sel = app.source_tree.selection()
+        assert len(sel) == 1
+        assert Path(app.source_tree.item(sel[0], "values")[0]).name == "01 Song One.flac"
+
+    def test_show_in_source_populates_empty_tree(self, app, gui_env):
+        """Show in source must populate the tree if it's empty."""
+        app._create_playlist()
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+        app._refresh_tracks()
+        _flush_tracks(app)
+
+        # Clear the source tree entirely
+        app.source_tree.delete(*app.source_tree.get_children())
+        assert len(app.source_tree.get_children()) == 0
+
+        src_rel = app._track_data[0]["src_path"]
+        app._show_track_in_source(src_rel)
+
+        sel = app.source_tree.selection()
+        assert len(sel) == 1
+        assert Path(app.source_tree.item(sel[0], "values")[0]).name == "01 Song One.flac"
 
     def test_show_in_playlists_highlights(self, app, gui_env):
         app._create_playlist()
