@@ -12,11 +12,23 @@ from conftest import _make_flac, assert_originals_untouched
 
 
 def _flush_bg_ops(app, timeout=10):
-    """Wait for all background playlist ops to finish and process callbacks."""
+    """Wait for all background playlist ops and track loading to finish."""
     deadline = time.monotonic() + timeout
-    while app._busy_playlists and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
         app.root.update()
+        busy = app._busy_playlists or getattr(app, "_tracks_loading", False)
+        if not busy:
+            break
         time.sleep(0.05)
+    app.root.update()
+
+
+def _flush_tracks(app, timeout=5):
+    """Wait for background track loading to complete."""
+    deadline = time.monotonic() + timeout
+    while getattr(app, "_tracks_loading", False) and time.monotonic() < deadline:
+        app.root.update()
+        time.sleep(0.02)
     app.root.update()
 
 
@@ -61,6 +73,13 @@ def app(gui_env, monkeypatch):
     a._stats_pending = False
     a._alive = True
     a._syncing = False
+    a._tag_cache = {}
+    a._audit_cache = {}
+    a._tracks_loading = False
+    a._tracks_gen = 0
+    from queue import Queue
+    a._callback_queue = Queue()
+    a._poll_callbacks()
     a._apply_theme()
     a._show_main()
 
@@ -197,6 +216,7 @@ class TestAppTracks:
         src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
         app.mgr.add_track(app.current_pid, src)
         app._refresh_tracks()
+        _flush_tracks(app)
 
         items = app.track_tree.get_children()
         assert len(items) == 1
@@ -262,6 +282,7 @@ class TestAppTracks:
         src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
         app.mgr.add_track(app.current_pid, src)
         app._refresh_tracks()
+        _flush_tracks(app)
 
         with patch("echolist.gui.messagebox.showinfo"):
             app._stage_add_files([src])
@@ -272,6 +293,7 @@ class TestAppTracks:
         src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
         app.mgr.add_track(app.current_pid, src)
         app._refresh_tracks()
+        _flush_tracks(app)
 
         items = app.track_tree.get_children()
         app.track_tree.selection_set(items[0])
@@ -300,6 +322,7 @@ class TestAppSync:
         src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
         app.mgr.add_track(app.current_pid, src)
         app._refresh_tracks()
+        _flush_tracks(app)
 
         items = app.track_tree.get_children()
         app.track_tree.selection_set(items[0])
@@ -339,6 +362,7 @@ class TestAppUndo:
         src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
         app.mgr.add_track(app.current_pid, src)
         app._refresh_tracks()
+        _flush_tracks(app)
 
         items = app.track_tree.get_children()
         app.track_tree.selection_set(items[0])
@@ -469,6 +493,7 @@ class TestAppReorder:
 
         # Refresh should preserve reorder
         app._refresh_tracks()
+        _flush_tracks(app)
         refreshed_keys = [row["key"] for row in app._track_data]
         assert refreshed_keys == reversed_keys
         assert refreshed_keys != original_keys
@@ -485,6 +510,7 @@ class TestAppReorder:
         app.staging.set_reorder(app.current_pid, [{"key": row["key"]} for row in app._track_data])
 
         app._refresh_tracks()
+        _flush_tracks(app)
         indices = [row["index"] for row in app._track_data]
         assert indices == [1, 2, 3]
 
@@ -505,6 +531,7 @@ class TestAppReorder:
         assert app.current_pid not in app.staging.pending_reorders
 
         app._refresh_tracks()
+        _flush_tracks(app)
         reset_keys = [row["key"] for row in app._track_data]
         assert reset_keys == original_keys
 
@@ -515,6 +542,7 @@ class TestAppReorder:
         app.mgr.add_track(app.current_pid, src1)
         app.mgr.add_track(app.current_pid, src2)
         app._refresh_tracks()
+        _flush_tracks(app)
 
         assert app._track_data[0]["key"] == "c:1"
         assert app._track_data[1]["key"] == "c:2"
@@ -904,6 +932,7 @@ class TestTrackContextMenu:
         app._do_sync_blocking()
         _flush_bg_ops(app)
         app._refresh_tracks()
+        _flush_tracks(app)
 
         src_rel = app._track_data[0]["src_path"]
         app._show_track_in_source(src_rel)

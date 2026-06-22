@@ -285,9 +285,9 @@ class PlaylistManager:
             if old_name != new_name:
                 try:
                     self.writer.rename(f"{folder}/{old_name}", f"{folder}/{new_name}")
+                    t["copy_name"] = new_name
                 except Exception:
                     pass
-                t["copy_name"] = new_name
 
     def stats(self, cached_device_tracks: int | None = None,
               cached_workspace_bytes: int | None = None) -> dict:

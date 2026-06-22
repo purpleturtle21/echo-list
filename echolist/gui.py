@@ -5,6 +5,7 @@ import json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
+from queue import Queue, Empty
 from threading import Thread
 
 import os
@@ -297,8 +298,42 @@ class App:
         self._stats_pending = False
         self._alive = True
         self._syncing = False
+        self._tag_cache: dict[str, tuple[str, str]] = {}
+        self._audit_cache: dict[str, list[dict]] = {}
+        self._tracks_loading = False
+        self._tracks_gen = 0
+        self._callback_queue: Queue = Queue()
+        self._poll_callbacks()
         self._apply_theme()
         self._show_setup()
+
+    def _invalidate_caches(self, pid: str | None = None):
+        """Clear tag and audit caches. If pid given, only that playlist."""
+        if pid is None:
+            self._tag_cache.clear()
+            self._audit_cache.clear()
+        else:
+            self._audit_cache.pop(pid, None)
+            pl = self.mgr.store.playlists.get(pid) if self.mgr else None
+            if pl:
+                prefix = f"{pl['folder']}/"
+                self._tag_cache = {k: v for k, v in self._tag_cache.items()
+                                   if not k.startswith(prefix)}
+
+    def _poll_callbacks(self):
+        """Drain the callback queue on the main thread (tkinter is not thread-safe on Windows)."""
+        try:
+            while True:
+                fn = self._callback_queue.get_nowait()
+                fn()
+        except Empty:
+            pass
+        if self._alive:
+            self.root.after(16, self._poll_callbacks)
+
+    def _schedule_callback(self, fn):
+        """Thread-safe way to schedule a function on the main thread."""
+        self._callback_queue.put(fn)
 
     def _set_icon(self):
         if ICON_PNG_PATH.exists():
@@ -508,7 +543,7 @@ class App:
         src_row.grid(row=row, column=1, columnspan=2, sticky="ew", padx=5, pady=(4, 0))
         ttk.Entry(src_row, textvariable=self._source_var, width=32).pack(side="left", fill="x", expand=True)
         ttk.Button(src_row, text="...", width=3,
-                    command=lambda: self._browse_var(self._source_var)).pack(side="left", padx=(4, 0))
+                    command=lambda: self._browse_var(self._source_var, "Select source music library")).pack(side="left", padx=(4, 0))
         row += 1
         tk.Label(frame, text="Your music library — files are copied from here, never modified",
                  font=("Consolas", 8), bg=BG, fg=FG_DIM, anchor="w").grid(
@@ -522,7 +557,7 @@ class App:
         dest_row.grid(row=row, column=1, columnspan=2, sticky="ew", padx=5, pady=(4, 0))
         ttk.Entry(dest_row, textvariable=self._dest_var, width=32).pack(side="left", fill="x", expand=True)
         ttk.Button(dest_row, text="...", width=3,
-                    command=lambda: self._browse_var(self._dest_var)).pack(side="left", padx=(4, 0))
+                    command=lambda: self._browse_var(self._dest_var, "Select destination device or folder")).pack(side="left", padx=(4, 0))
         row += 1
         tk.Label(frame, text="Device or folder where playlists are stored",
                  font=("Consolas", 8), bg=BG, fg=FG_DIM, anchor="w").grid(
@@ -589,8 +624,8 @@ class App:
                     pass
         return {}
 
-    def _browse_var(self, var):
-        d = filedialog.askdirectory(initialdir=var.get())
+    def _browse_var(self, var, title="Select folder"):
+        d = filedialog.askdirectory(initialdir=var.get(), title=title)
         if d:
             var.set(d)
 
@@ -930,6 +965,7 @@ class App:
         self.track_tree.tag_configure("pending", foreground=PENDING_FG)
         self.track_tree.tag_configure("removed", foreground="#555555")
         self.track_tree.tag_configure("offloaded_track", foreground=FG_DIM)
+        self.track_tree.tag_configure("loading", foreground=FG_DIM)
 
         # Right-click context menu on tracks
         self.track_tree.bind("<Button-3>", self._track_context_menu)
@@ -1532,6 +1568,7 @@ class App:
             self.mgr.store.save()
 
         def on_done(_):
+            self._invalidate_caches(pid)
             self._refresh_playlists()
             self._refresh_tracks()
             self._update_status()
@@ -1559,6 +1596,7 @@ class App:
         def on_done(tracks):
             pl["offloaded"] = False
             self.mgr.store.save()
+            self._invalidate_caches(pid)
             source_root = Path(self.mgr.config.source_root)
             missing = []
             for entry in tracks:
@@ -1975,10 +2013,7 @@ class App:
             j_idx = 0
 
             def _ui(fn):
-                try:
-                    self.root.after(0, fn)
-                except RuntimeError:
-                    pass
+                self._schedule_callback(fn)
 
             for r in removes:
                 journal.mark_current(j_idx)
@@ -2020,16 +2055,7 @@ class App:
             for i in range(j_idx, len(journal.actions)):
                 journal.mark_done(i)
             journal.complete()
-            try:
-                self.root.after(0, lambda: _finish(errors))
-            except RuntimeError:
-                self._syncing = False
-                self.staging.clear()
-                self._undo_stack.clear()
-                if errors:
-                    import sys
-                    print(f"EchoList: sync finished with errors "
-                          f"(UI already closed): {errors}", file=sys.stderr)
+            self._schedule_callback(lambda: _finish(errors))
 
         def _update_progress(done, label=""):
             self.sync_progress["value"] = done
@@ -2043,6 +2069,7 @@ class App:
             self._set_ui_locked(False)
             self.staging.clear()
             self._undo_stack.clear()
+            self._invalidate_caches()
             self.sync_progress.pack_forget()
             self.sync_status_lbl.pack_forget()
             self.sync_file_bar.pack_forget()
@@ -2142,14 +2169,7 @@ class App:
                 result = operation()
             except Exception as e:
                 error = e
-            try:
-                self.root.after(0, lambda: finish(result, error))
-            except RuntimeError:
-                self._busy_playlists.discard(pid)
-                if error:
-                    import sys
-                    print(f"EchoList: playlist op '{display_name}' failed "
-                          f"(UI already closed): {error}", file=sys.stderr)
+            self._schedule_callback(lambda: finish(result, error))
 
         def finish(result, error):
             self._busy_playlists.discard(pid)
@@ -2238,7 +2258,24 @@ class App:
             self.fix_meta_btn.pack_forget()
             return
 
-        issues = self.mgr.audit_playlist_metadata(self.current_pid)
+        pid = self.current_pid
+        cached = self._audit_cache.get(pid)
+        if cached is not None:
+            self._apply_audit_result(pid, cached)
+            return
+
+        def _audit():
+            issues = self.mgr.audit_playlist_metadata(pid)
+            self._audit_cache[pid] = issues
+            if not self._alive:
+                return
+            self._schedule_callback(lambda: self._apply_audit_result(pid, issues))
+
+        Thread(target=_audit, daemon=True).start()
+
+    def _apply_audit_result(self, pid: str, issues: list[dict]):
+        if self.current_pid != pid:
+            return
         if issues:
             n = len(set(i["copy_name"] for i in issues))
             self.fix_meta_btn.config(text=f"Fix metadata ({n})")
@@ -2324,6 +2361,7 @@ class App:
                 return self.mgr.fix_playlist_metadata(pid)
 
             def on_done(fixed):
+                self._invalidate_caches(pid)
                 self._refresh_playlists_menu()
                 self.fix_meta_btn.pack_forget()
                 self._refresh_tracks()
@@ -2615,11 +2653,38 @@ class App:
             self._track_data = []
             self._removed_data = []
             return
-        self.mgr.rescan_playlist(self.current_pid)
-        playlist = self.mgr.store.playlists[self.current_pid]
-        active, removed = self.staging.virtual_tracks(self.current_pid, playlist["tracks"])
+        pid = self.current_pid
+        playlist = self.mgr.store.playlists[pid]
+        folder = playlist["folder"]
 
-        self._track_data = []
+        # Check if all committed track tags are cached — if so, skip the thread
+        committed = [t for t in playlist["tracks"]
+                     if t.get("copy_name")]
+        all_cached = all(
+            f"{folder}/{t['copy_name']}" in self._tag_cache
+            for t in committed
+        )
+
+        self._tracks_gen += 1
+        gen = self._tracks_gen
+
+        if all_cached:
+            self._load_tracks_sync(pid, gen)
+        else:
+            self._tracks_loading = True
+            self.track_tree.insert("", "end", iid="_loading",
+                                   values=("", "Loading...", ""), tags=("loading",))
+            Thread(target=self._load_tracks_bg, args=(pid, gen), daemon=True).start()
+
+    def _build_track_data(self, pid: str):
+        """Build track/removed data lists. Called from any thread."""
+        self.mgr.rescan_playlist(pid)
+        playlist = self.mgr.store.playlists.get(pid)
+        if not playlist:
+            return [], []
+        active, removed = self.staging.virtual_tracks(pid, playlist["tracks"])
+
+        track_data = []
         for t in active:
             if t.get("_pending"):
                 title = t.get("title", "")
@@ -2628,7 +2693,7 @@ class App:
                 title, artist = self._read_track_tags(
                     playlist["folder"], t.get("copy_name", ""), t.get("src_path", "")
                 )
-            self._track_data.append({
+            track_data.append({
                 "index": t["index"],
                 "title": title,
                 "artist": artist,
@@ -2638,12 +2703,12 @@ class App:
                 "key": t.get("_key", ""),
             })
 
-        self._removed_data = []
+        removed_data = []
         for t in removed:
             title, artist = self._read_track_tags(
                 playlist["folder"], t.get("copy_name", ""), t.get("src_path", "")
             )
-            self._removed_data.append({
+            removed_data.append({
                 "index": t["index"],
                 "title": title,
                 "artist": artist,
@@ -2651,7 +2716,35 @@ class App:
                 "key": t.get("_key", ""),
             })
 
+        return track_data, removed_data
+
+    def _load_tracks_sync(self, pid: str, gen: int):
+        track_data, removed_data = self._build_track_data(pid)
+        if self._tracks_gen != gen:
+            return
+        self._track_data = track_data
+        self._removed_data = removed_data
         self._display_tracks()
+
+    def _load_tracks_bg(self, pid: str, gen: int):
+        try:
+            track_data, removed_data = self._build_track_data(pid)
+        except Exception:
+            self._tracks_loading = False
+            return
+        if not self._alive or self._tracks_gen != gen:
+            self._tracks_loading = False
+            return
+
+        def _apply():
+            self._tracks_loading = False
+            if self._tracks_gen != gen:
+                return
+            self._track_data = track_data
+            self._removed_data = removed_data
+            self._display_tracks()
+
+        self._schedule_callback(_apply)
 
     def _display_tracks(self):
         self.track_tree.delete(*self.track_tree.get_children())
@@ -2787,8 +2880,12 @@ class App:
         self._update_status()
 
     def _read_track_tags(self, folder: str, copy_name: str, src_path: str = "") -> tuple[str, str]:
-        # Try the copy first
         if copy_name:
+            cache_key = f"{folder}/{copy_name}"
+            cached = self._tag_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
             try:
                 import mutagen
                 path = self.mgr.writer.root / folder / copy_name
@@ -2797,16 +2894,19 @@ class App:
                     title = m.get("title", [""])[0]
                     artist = m.get("artist", [""])[0]
                     if title or artist:
+                        self._tag_cache[cache_key] = (title, artist)
                         return title, artist
             except Exception:
                 pass
 
-        # Fallback: read from original source
         if src_path:
             source_root = Path(self.mgr.config.source_root)
             src_full = _resolve_source_file(src_path, source_root)
             if src_full:
-                return _read_tags_from_file(src_full)
+                result = _read_tags_from_file(src_full)
+                if copy_name:
+                    self._tag_cache[f"{folder}/{copy_name}"] = result
+                return result
 
         return copy_name or "", ""
 
@@ -2903,10 +3003,7 @@ class App:
             except Exception:
                 dt, wb = 0, 0
             if self._alive:
-                try:
-                    self.root.after(0, lambda: self._on_expensive_stats(dt, wb))
-                except RuntimeError:
-                    pass
+                self._schedule_callback(lambda: self._on_expensive_stats(dt, wb))
 
         t = Thread(target=worker, daemon=True)
         t.start()

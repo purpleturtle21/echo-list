@@ -911,3 +911,184 @@ def test_adopt_raises_if_already_tracked(manager, source):
     manager.create_playlist("Workout")
     with pytest.raises(ValueError, match="already exists"):
         manager.adopt_playlist("Workout")
+
+
+# ── Track number zero-padding ──
+
+_TINY_MP3 = __import__("base64").b64decode(
+    "SUQzBAAAAAAAAP/7kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/7kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/7kAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAP/7kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+)
+
+_TINY_M4A = __import__("base64").b64decode(
+    "AAAAGGZ0eXBNNEEgAAAAAE00QSBtcDQyAAABJW1vb3YAAABsbXZoZAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPoAAAArXRyYWsAAABcdGtoZAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAEltZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAAKxEAAAAAAAAAAAA"
+    "AAAhaGRscgAAAAAAAAAAc291bgAAAAAAAAAAAAAAAAA="
+)
+
+
+def _make_mp3(path, artist="TestArtist", title="TestSong"):
+    from mutagen.easyid3 import EasyID3
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_TINY_MP3)
+    try:
+        t = EasyID3(path)
+    except Exception:
+        t = EasyID3()
+    t["artist"] = artist
+    t["title"] = title
+    t["album"] = "Test Album"
+    t["tracknumber"] = "1"
+    t.save(path)
+
+
+def _make_m4a(path, artist="TestArtist", title="TestSong"):
+    from mutagen.easymp4 import EasyMP4
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_TINY_M4A)
+    try:
+        t = EasyMP4(path)
+    except Exception:
+        t = EasyMP4()
+    t["artist"] = artist
+    t["title"] = title
+    t["album"] = "Test Album"
+    t["tracknumber"] = "1"
+    t.save(path)
+
+
+def test_flac_tracknumber_written(manager, source):
+    """FLAC tracks must get tracknumber set to the playlist index."""
+    pid = manager.create_playlist("Pad")
+    manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
+    track = manager.store.playlists[pid]["tracks"][0]
+    f = FLAC(manager.writer.root / "Pad" / track["copy_name"])
+    assert f["TRACKNUMBER"] == ["1"]
+
+
+def test_mp3_tracknumber_written(manager, source):
+    """MP3 tracks must get tracknumber set to the playlist index."""
+    from mutagen.easyid3 import EasyID3
+    mp3_src = source / "ArtistA" / "song.mp3"
+    _make_mp3(mp3_src)
+    pid = manager.create_playlist("Mp3Pad")
+    manager.add_track(pid, mp3_src)
+    track = manager.store.playlists[pid]["tracks"][0]
+    t = EasyID3(manager.writer.root / "Mp3Pad" / track["copy_name"])
+    assert t["tracknumber"] == ["1"]
+
+
+def test_m4a_tracknumber_written(manager, source):
+    """M4A tracks must get tracknumber set (stored as integer by MP4 container)."""
+    from mutagen.easymp4 import EasyMP4
+    m4a_src = source / "ArtistA" / "song.m4a"
+    _make_m4a(m4a_src)
+    pid = manager.create_playlist("M4aPad")
+    manager.add_track(pid, m4a_src)
+    track = manager.store.playlists[pid]["tracks"][0]
+    t = EasyMP4(manager.writer.root / "M4aPad" / track["copy_name"])
+    assert t["tracknumber"] == ["1"]
+
+
+def test_m4a_audit_detects_wrong_tracknumber(manager, source):
+    """Audit must flag tracknumber mismatches on M4A files."""
+    from mutagen.easymp4 import EasyMP4
+    m4a_src = source / "ArtistA" / "song.m4a"
+    _make_m4a(m4a_src)
+    pid = manager.create_playlist("M4aAudit")
+    manager.add_track(pid, m4a_src)
+    track = manager.store.playlists[pid]["tracks"][0]
+    track_path = manager.writer.root / "M4aAudit" / track["copy_name"]
+
+    t = EasyMP4(track_path)
+    t["tracknumber"] = "99"
+    t.save(track_path)
+
+    issues = manager.audit_playlist_metadata(pid)
+    tn_issues = [i for i in issues if i["field"] == "tracknumber"]
+    assert len(tn_issues) == 1
+
+
+def test_mp3_fix_metadata_resolves_tracknumber(manager, source):
+    """Fix metadata on MP3 with wrong tracknumber should resolve cleanly."""
+    from mutagen.easyid3 import EasyID3
+    mp3_src = source / "ArtistA" / "song.mp3"
+    _make_mp3(mp3_src)
+    pid = manager.create_playlist("Mp3Fix")
+    manager.add_track(pid, mp3_src)
+    track = manager.store.playlists[pid]["tracks"][0]
+    track_path = manager.writer.root / "Mp3Fix" / track["copy_name"]
+
+    t = EasyID3(track_path)
+    t["tracknumber"] = "8"
+    t.save(track_path)
+
+    issues = manager.audit_playlist_metadata(pid)
+    tn_issues = [i for i in issues if i["field"] == "tracknumber"]
+    assert len(tn_issues) == 1
+
+    fixed = manager.fix_playlist_metadata(pid)
+    assert fixed == 1
+    assert manager.audit_playlist_metadata(pid) == []
+
+
+def test_normalize_tracknumber_passthrough():
+    """_normalize_tracknumber returns the track number as-is."""
+    from echolist.tags import _normalize_tracknumber
+    assert _normalize_tracknumber("6") == "6"
+    assert _normalize_tracknumber("13") == "13"
+    assert _normalize_tracknumber("1") == "1"
+    assert _normalize_tracknumber("99") == "99"
+
+
+def test_normalize_tracknumber_strips_total():
+    """_normalize_tracknumber strips N/M suffix."""
+    from echolist.tags import _normalize_tracknumber
+    assert _normalize_tracknumber("6/12") == "6"
+    assert _normalize_tracknumber("10/2") == "10"
+    assert _normalize_tracknumber("3\\8") == "3"
+
+
+def test_adopt_m4a_playlist_tracknumbers(manager):
+    """Adopting a folder with M4A files writes tracknumbers."""
+    ext_folder = manager.writer.root / "M4aAdopt"
+    ext_folder.mkdir(parents=True, exist_ok=True)
+    for i, name in enumerate(["SongA", "SongB", "SongC"], 1):
+        p = ext_folder / f"{i} - {name}.m4a"
+        _make_m4a(p, artist=f"Artist{i}", title=name)
+
+    pid = manager.adopt_playlist("M4aAdopt")
+
+    # After adopt, audit should be clean — no persistent mismatch
+    assert manager.audit_playlist_metadata(pid) == []
