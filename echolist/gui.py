@@ -1431,7 +1431,7 @@ class App:
     def _show_track_in_source(self, src_path: str):
         if not src_path:
             return
-        source_root = Path(self.mgr.config.source_root)
+        source_root = Path(self.mgr.config.source_root).resolve()
         full = _resolve_source_file(src_path, source_root)
         if not full:
             messagebox.showinfo("Not found", f"Source file not found:\n{src_path}")
@@ -1444,6 +1444,10 @@ class App:
         except ValueError:
             messagebox.showinfo("Not found", f"File is outside source root:\n{full}")
             return
+        # Ensure the source tree is populated
+        if not self.source_tree.get_children():
+            if source_root.exists():
+                self._populate_source_tree(source_root)
         parts = list(rel.parts)
         parent_iid = ""
         for i, part in enumerate(parts):
