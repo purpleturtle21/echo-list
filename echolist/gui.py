@@ -1442,7 +1442,21 @@ class App:
         try:
             rel = full.relative_to(source_root)
         except ValueError:
-            messagebox.showinfo("Not found", f"File is outside source root:\n{full}")
+            # File outside source root — insert its parent folder as a
+            # browsable top-level entry, then select the file inside it
+            parent_dir = full.parent
+            display = str(parent_dir) + "/"
+            folder_iid = self.source_tree.insert("", 0, text=display,
+                                                  values=(str(parent_dir),))
+            self._insert_children(folder_iid, parent_dir)
+            self.source_tree.item(folder_iid, open=True)
+            # Find and select the file
+            for child in self.source_tree.get_children(folder_iid):
+                if Path(self.source_tree.item(child, "values")[0]).name == full.name:
+                    self.source_tree.selection_set(child)
+                    self.source_tree.see(child)
+                    self.source_tree.focus(child)
+                    break
             return
         # Ensure the source tree is populated
         if not self.source_tree.get_children():
