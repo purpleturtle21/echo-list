@@ -11,7 +11,7 @@ from threading import Thread
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
-__version__ = "0.2.1"
+__version__ = "0.0.1"
 
 GITHUB_REPO = "purpleturtle21/echo-list"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
