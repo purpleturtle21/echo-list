@@ -13,6 +13,7 @@ import signal
 import subprocess
 import platform
 import string
+import webbrowser
 from datetime import datetime
 
 from .manager import PlaylistManager, WorkspaceLockError, AUDIO_EXTS
@@ -345,7 +346,9 @@ class App:
         self._callback_queue: Queue = Queue()
         self._poll_callbacks()
         self._apply_theme()
+        self._update_info = None
         self._show_setup()
+        self.root.after(1500, self._check_for_updates)
 
     def _invalidate_caches(self, pid: str | None = None):
         """Clear tag and audit caches. If pid given, only that playlist."""
@@ -456,6 +459,9 @@ class App:
         self.root.config(menu=tk.Menu(self.root))
         self._center_window(420, 280)
 
+        self._setup_update_slot = ttk.Frame(self.root, padding=(20, 8))
+        self._setup_update_slot.pack(fill="x", side="bottom")
+
         frame = ttk.Frame(self.root, padding=20)
         frame.pack(fill="both", expand=True)
 
@@ -478,6 +484,7 @@ class App:
         self._setup_polling = True
         self._last_setup_state = None
         self._setup_poll_id = self.root.after(200, self._poll_setup)
+        self._refresh_update_banner()
 
     def _poll_setup(self):
         """Re-check for the device every 2s while the setup screen is showing,
@@ -1138,31 +1145,102 @@ class App:
         if source_root.exists():
             self._populate_source_tree(source_root)
 
-        self.root.after(1000, self._check_for_updates)
-
     def _check_for_updates(self):
-        from .updater import check_for_update, __version__
+        """Check GitHub for a newer release. Non-invasive: just records the
+        result and lets the setup screen's banner show it whenever it's up —
+        never pops a dialog on its own.
+
+        The check itself is a harmless read-only API call, safe for every
+        install type. Self-replacement is not: sys.executable for a frozen
+        PyInstaller binary is the app itself, but for a pip/source install
+        it's the Python interpreter, and apply_update_and_restart would
+        rename/chmod/exec THAT instead. So the "Update" button only appears
+        when frozen (see _build_update_banner) — everyone else still sees
+        the version + Changelog link, just no self-update action."""
+        from .updater import check_for_update
 
         def on_update(latest_ver, download_url, release_url):
-            def _prompt():
-                result = messagebox.askyesno(
-                    "Update Available",
-                    f"EchoList v{latest_ver} is available (you have v{__version__}).\n\n"
-                    "Download and install the update?",
-                )
-                if result and download_url:
-                    self._download_update(download_url)
-            self._schedule_callback(_prompt)
+            def _apply():
+                self._update_info = {
+                    "version": latest_ver,
+                    "download_url": download_url,
+                    "release_url": release_url,
+                }
+                self._refresh_update_banner()
+            self._schedule_callback(_apply)
 
         check_for_update(on_update_available=on_update)
+
+    def _refresh_update_banner(self):
+        slot = getattr(self, "_setup_update_slot", None)
+        if slot is None:
+            return
+        try:
+            for w in slot.winfo_children():
+                w.destroy()
+        except tk.TclError:
+            self._setup_update_slot = None
+            return
+        if self._update_info:
+            self._build_update_banner(slot)
+
+    def _build_update_banner(self, parent):
+        from .updater import _is_frozen
+        info = self._update_info
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+
+        label = tk.Label(row, text=f"Update available: v{info['version']}",
+                          font=("Consolas", 9), bg=BG, fg=YELLOW, anchor="w")
+        label.pack(side="left", fill="x", expand=True)
+        self._update_banner_label = label
+
+        self._update_banner_button = None
+        if _is_frozen():
+            update_btn = ttk.Button(row, text="Update", style="Accent.TButton",
+                                     command=self._download_update_from_banner)
+            update_btn.pack(side="right")
+            if not info.get("download_url"):
+                update_btn.state(["disabled"])
+            self._update_banner_button = update_btn
+
+        changelog_lbl = tk.Label(row, text="Changelog",
+                                  font=("Consolas", 9, "underline"),
+                                  bg=BG, fg=FG_DIM, cursor="hand2")
+        changelog_lbl.pack(side="right", padx=(0, 8))
+        changelog_lbl.bind("<Button-1>", lambda e: self._open_update_changelog())
+
+    def _open_update_changelog(self):
+        url = (self._update_info or {}).get("release_url")
+        if url:
+            webbrowser.open(url)
+
+    def _download_update_from_banner(self):
+        download_url = (self._update_info or {}).get("download_url")
+        if download_url:
+            self._download_update(download_url)
 
     def _download_update(self, download_url):
         from .updater import download_and_replace, apply_update_and_restart
 
-        self.pending_lbl.config(text="Downloading update...", fg=YELLOW)
+        def set_status(msg):
+            label = getattr(self, "_update_banner_label", None)
+            if label:
+                try:
+                    label.config(text=msg, fg=YELLOW)
+                except tk.TclError:
+                    pass
+
+        set_status("Downloading update...")
+        btn = getattr(self, "_update_banner_button", None)
+        if btn:
+            try:
+                btn.state(["disabled"])
+            except tk.TclError:
+                pass
 
         def on_progress(msg):
-            self._schedule_callback(lambda: self.pending_lbl.config(text=msg, fg=YELLOW))
+            self._schedule_callback(lambda: set_status(msg))
 
         def on_done(current_exe, new_exe):
             def _apply():
@@ -1170,16 +1248,20 @@ class App:
                     apply_update_and_restart(current_exe, new_exe)
                 except Exception as e:
                     messagebox.showerror("Update failed", str(e))
-                    self.pending_lbl.config(text="", fg=PENDING_FG)
+                    set_status(f"Update available: v{self._update_info['version']}")
+                    if btn:
+                        btn.state(["!disabled"])
             self._schedule_callback(_apply)
 
         def on_error(msg):
             self._schedule_callback(
                 lambda: messagebox.showerror("Update failed", msg)
             )
-            self._schedule_callback(
-                lambda: self.pending_lbl.config(text="", fg=PENDING_FG)
-            )
+            def _reset():
+                set_status(f"Update available: v{self._update_info['version']}")
+                if btn:
+                    btn.state(["!disabled"])
+            self._schedule_callback(_reset)
 
         download_and_replace(download_url, on_progress=on_progress,
                              on_done=on_done, on_error=on_error)

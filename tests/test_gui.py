@@ -1674,3 +1674,136 @@ class TestResolveSourceFile:
         _resolve_source_file("wrong/path/01 Song One.flac", src)
         after = set(src.rglob("*"))
         assert before == after
+
+
+class TestUpdateBanner:
+    """The update check must never interrupt the user with a dialog — it
+    only records the result and lets the setup screen's banner surface it,
+    with explicit Update/Changelog actions the user can ignore indefinitely."""
+
+    def _new_app(self):
+        from tkinter import ttk
+        a = App.__new__(App)
+        a.root = tk.Tk()
+        a.root.withdraw()
+        a._update_info = None
+        a._apply_theme()
+        a._setup_update_slot = ttk.Frame(a.root)
+        a._setup_update_slot.pack()
+        return a
+
+    def _teardown(self, a):
+        a.root.destroy()
+
+    def test_no_banner_when_no_update_available(self):
+        a = self._new_app()
+        a._refresh_update_banner()
+        assert len(a._setup_update_slot.winfo_children()) == 0
+        self._teardown(a)
+
+    def test_banner_shows_version_with_enabled_update_button_when_frozen(self, monkeypatch):
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: True)
+        a = self._new_app()
+        a._update_info = {"version": "9.9.9", "download_url": "https://x/bin",
+                          "release_url": "https://x/rel"}
+        a._refresh_update_banner()
+        assert "9.9.9" in a._update_banner_label.cget("text")
+        assert "disabled" not in a._update_banner_button.state()
+        self._teardown(a)
+
+    def test_update_button_disabled_without_matching_asset_when_frozen(self, monkeypatch):
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: True)
+        a = self._new_app()
+        a._update_info = {"version": "9.9.9", "download_url": None,
+                          "release_url": "https://x/rel"}
+        a._refresh_update_banner()
+        assert "disabled" in a._update_banner_button.state()
+        self._teardown(a)
+
+    def test_no_update_button_when_not_frozen(self, monkeypatch):
+        """Regression: pip/source installs must never see an "Update" button —
+        sys.executable there is the Python interpreter, not the app, and
+        self-replacement would corrupt it. Version info + Changelog still show."""
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: False)
+        a = self._new_app()
+        a._update_info = {"version": "9.9.9", "download_url": "https://x/bin",
+                          "release_url": "https://x/rel"}
+        a._refresh_update_banner()
+        assert "9.9.9" in a._update_banner_label.cget("text")
+        assert a._update_banner_button is None
+        self._teardown(a)
+
+    def test_changelog_opens_release_url_in_browser(self, monkeypatch):
+        a = self._new_app()
+        a._update_info = {"version": "9.9.9", "download_url": "https://x/bin",
+                          "release_url": "https://x/rel"}
+        a._refresh_update_banner()
+        opened = []
+        monkeypatch.setattr("echolist.gui.webbrowser.open", lambda url: opened.append(url))
+        a._open_update_changelog()
+        assert opened == ["https://x/rel"]
+        self._teardown(a)
+
+    def test_update_button_triggers_download_with_correct_url(self, monkeypatch):
+        a = self._new_app()
+        a._update_info = {"version": "9.9.9", "download_url": "https://x/bin",
+                          "release_url": "https://x/rel"}
+        a._refresh_update_banner()
+        calls = []
+        monkeypatch.setattr(a, "_download_update", lambda url: calls.append(url))
+        a._download_update_from_banner()
+        assert calls == ["https://x/bin"]
+        self._teardown(a)
+
+    def test_check_for_updates_never_shows_a_dialog(self, monkeypatch):
+        """Regression: this used to be a blocking messagebox.askyesno the
+        instant a new version was found. Now it must only populate state
+        and let the banner render it — no dialog, ever."""
+        from queue import Queue
+        a = self._new_app()
+        a._callback_queue = Queue()
+
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: True)
+
+        def fake_check(on_update_available=None, on_no_update=None, on_error=None):
+            on_update_available("9.9.9", "https://x/bin", "https://x/rel")
+        monkeypatch.setattr("echolist.updater.check_for_update", fake_check)
+
+        dialog_shown = []
+        monkeypatch.setattr("echolist.gui.messagebox.askyesno",
+                             lambda *a, **k: dialog_shown.append(True))
+
+        a._check_for_updates()
+        while not a._callback_queue.empty():
+            a._callback_queue.get_nowait()()
+
+        assert dialog_shown == []
+        assert a._update_info["version"] == "9.9.9"
+        assert "9.9.9" in a._update_banner_label.cget("text")
+        self._teardown(a)
+
+    @pytest.mark.parametrize("frozen", [True, False])
+    def test_check_for_updates_always_runs_regardless_of_frozen_state(self, monkeypatch, frozen):
+        """The version check itself is a harmless read-only API call, safe
+        for every install type — only the "Update" button (see
+        _build_update_banner) is gated on being frozen, not the check."""
+        a = self._new_app()
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: frozen)
+        called = []
+        monkeypatch.setattr("echolist.updater.check_for_update",
+                             lambda **kw: called.append(True))
+        a._check_for_updates()
+        assert called == [True]
+        self._teardown(a)
+
+    def test_stale_setup_slot_after_screen_switch_is_ignored(self):
+        """If the setup screen's frame was destroyed (e.g. workspace opened
+        and _show_main took over) before the check completed, refreshing
+        the banner must not raise."""
+        a = self._new_app()
+        a._setup_update_slot.destroy()
+        a._update_info = {"version": "9.9.9", "download_url": "https://x/bin",
+                          "release_url": "https://x/rel"}
+        a._refresh_update_banner()  # must not raise
+        assert a._setup_update_slot is None
+        self._teardown(a)
