@@ -12,7 +12,7 @@ Songs can belong to multiple playlists. Your original library is never touched.
 
 ## Download
 
-**[Latest release (v0.2.0)](https://github.com/purpleturtle21/echo-list/releases/latest)** — Windows, Linux, macOS
+**[Latest release (v0.2.1)](https://github.com/purpleturtle21/echo-list/releases/latest)** — Windows, Linux, macOS
 
 | Platform | File | Notes |
 |----------|------|-------|

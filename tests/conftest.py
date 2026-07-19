@@ -30,8 +30,11 @@ def _make_flac(path: Path, artist: str, title: str) -> None:
 
 @pytest.fixture(autouse=True)
 def _isolate_backups(tmp_path, monkeypatch):
-    """Redirect BACKUPS_ROOT to a temp dir so tests don't pollute ~/.echolist/."""
+    """Redirect BACKUPS_ROOT and DEFAULT_FILE to a temp dir so tests don't
+    pollute the real ~/.echolist/ (default.json, backups) on the machine
+    running them — _open_workspace() writes to both as a side effect."""
     monkeypatch.setattr(_config, "BACKUPS_ROOT", tmp_path / "backups")
+    monkeypatch.setattr(_config, "DEFAULT_FILE", tmp_path / "default.json")
 
 
 @pytest.fixture

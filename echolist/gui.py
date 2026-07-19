@@ -10,6 +10,7 @@ from threading import Thread
 
 import os
 import signal
+import subprocess
 import platform
 import string
 from datetime import datetime
@@ -24,6 +25,10 @@ M3U_EXTS = frozenset({".m3u", ".m3u8"})
 
 
 def _detect_echo_mini() -> str | None:
+    if os.environ.get("ECHOLIST_DISABLE_DEVICE_DETECT"):
+        # Dev sandbox escape hatch (see scripts/dev-run.sh) — prevents a real
+        # plugged-in device from ever being picked up during local dev/testing.
+        return None
     system = platform.system()
     if system == "Windows":
         import ctypes
@@ -75,6 +80,16 @@ def _is_external_path(path: str) -> bool:
         return path.startswith("/Volumes/")
     else:
         return path.startswith("/media/") or path.startswith("/run/media/")
+
+
+def _open_in_file_browser(path: Path) -> None:
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(str(path))  # noqa: S606
+    elif system == "Darwin":
+        subprocess.run(["open", str(path)], check=False)
+    else:
+        subprocess.run(["xdg-open", str(path)], check=False)
 
 
 # ── Theme colors ──
@@ -309,7 +324,10 @@ class App:
         self.mgr = None
         self.source = None
         self.dest = None
+        self.dest_mode = "auto"
         self.current_pid = None
+        self._setup_polling = False
+        self._setup_poll_id = None
         self.staging = StagingState()
         self._undo_stack: list[dict] = []
         self._sort_col = None
@@ -457,51 +475,66 @@ class App:
         adv_lbl.pack(pady=(10, 0))
         adv_lbl.bind("<Button-1>", lambda e: self._show_settings())
 
-        self.root.after(200, self._detect_and_show)
+        self._setup_polling = True
+        self._last_setup_state = None
+        self._setup_poll_id = self.root.after(200, self._poll_setup)
+
+    def _poll_setup(self):
+        """Re-check for the device every 2s while the setup screen is showing,
+        so plugging it in is picked up without pressing Retry."""
+        if not self._setup_polling or self.mgr is not None:
+            return
+        try:
+            self._detect_and_show()
+        except tk.TclError:
+            return
+        if self._setup_polling and self.mgr is None:
+            self._setup_poll_id = self.root.after(2000, self._poll_setup)
+
+    def _stop_setup_polling(self):
+        self._setup_polling = False
+        if self._setup_poll_id:
+            try:
+                self.root.after_cancel(self._setup_poll_id)
+            except Exception:
+                pass
+            self._setup_poll_id = None
 
     def _detect_and_show(self):
         defaults = load_defaults()
-        saved_source = defaults.get("source", "")
-        saved_dest = defaults.get("dest", "")
-        echo_mini = _detect_echo_mini()
+        dest_mode = defaults.get("dest_mode", "auto")
+        manual_dest = defaults.get("dest", "") if dest_mode == "manual" else ""
+
+        if dest_mode == "manual" and manual_dest:
+            state_key = ("manual", manual_dest, Path(manual_dest).exists())
+        else:
+            state_key = ("auto", _detect_echo_mini())
+
+        if state_key == self._last_setup_state:
+            # Nothing actually changed since the last check — skip the
+            # destroy/rebuild cycle so Retry/Browse don't flicker every poll.
+            return
+        self._last_setup_state = state_key
 
         for w in self._setup_btn_frame.winfo_children():
             w.destroy()
 
-        if saved_source and saved_dest:
-            dest_exists = Path(saved_dest).exists()
-            if echo_mini:
-                self._setup_status.config(
-                    text=f"Echo Mini connected at {echo_mini}", fg=GREEN)
-            elif dest_exists:
-                self._setup_status.config(
-                    text=f"Workspace: {saved_dest}", fg=FG)
-            else:
-                self._setup_status.config(
-                    text=f"Saved destination not found:\n{saved_dest}\n\n"
-                         f"Connect your device or change workspace in Settings.",
-                    fg=FG_DIM)
-                btn_row = ttk.Frame(self._setup_btn_frame)
-                btn_row.pack()
-                ttk.Button(btn_row, text="Retry",
-                            command=self._detect_and_show).pack(side="left", padx=5)
-                ttk.Button(btn_row, text="Browse...",
-                            command=self._browse_dest).pack(side="left", padx=5)
-                return
+        if state_key[0] == "manual":
+            self._render_manual_status(manual_dest, state_key[2])
+        else:
+            self._render_auto_status(state_key[1])
 
-            dest = echo_mini or saved_dest
-            ttk.Button(self._setup_btn_frame, text="[ OPEN ]",
-                        style="Accent.TButton",
-                        command=lambda: self._open_with_dest(dest)).pack(pady=5)
-        elif echo_mini:
+    def _render_auto_status(self, echo_mini: str | None):
+        if echo_mini:
             self._setup_status.config(
-                text=f"Echo Mini found at {echo_mini}", fg=GREEN)
-            ttk.Button(self._setup_btn_frame, text="[ OPEN ]",
+                text=f"Echo Mini connected at {echo_mini}", fg=GREEN)
+            ttk.Button(self._setup_btn_frame, text="[ START ]",
                         style="Accent.TButton",
-                        command=lambda: self._open_with_dest(echo_mini)).pack(pady=5)
+                        command=lambda: self._start_setup(echo_mini, "auto")).pack(pady=5)
         else:
             self._setup_status.config(
-                text="Echo Mini not detected.\nConnect your player or choose a folder.",
+                text="Echo Mini not detected.\n"
+                     "Connect your player — it will be picked up automatically.",
                 fg=FG_DIM)
             btn_row = ttk.Frame(self._setup_btn_frame)
             btn_row.pack()
@@ -509,6 +542,35 @@ class App:
                         command=self._detect_and_show).pack(side="left", padx=5)
             ttk.Button(btn_row, text="Browse...",
                         command=self._browse_dest).pack(side="left", padx=5)
+
+    def _render_manual_status(self, manual_dest: str, dest_exists: bool):
+        if dest_exists:
+            self._setup_status.config(
+                text=f"Using manual destination:\n{manual_dest}", fg=FG)
+            ttk.Button(self._setup_btn_frame, text="[ START ]",
+                        style="Accent.TButton",
+                        command=lambda: self._start_setup(manual_dest, "manual")).pack(pady=5)
+        else:
+            self._setup_status.config(
+                text=f"Manual destination not found:\n{manual_dest}\n\n"
+                     f"Connect the device or choose another folder.",
+                fg=FG_DIM)
+            btn_row = ttk.Frame(self._setup_btn_frame)
+            btn_row.pack()
+            ttk.Button(btn_row, text="Retry",
+                        command=self._detect_and_show).pack(side="left", padx=5)
+            ttk.Button(btn_row, text="Browse...",
+                        command=self._browse_dest).pack(side="left", padx=5)
+
+        link = tk.Label(self._setup_btn_frame, text="Switch to auto-detect",
+                         font=("Consolas", 9, "underline"),
+                         bg=BG, fg=FG_DIM, cursor="hand2")
+        link.pack(pady=(8, 0))
+        link.bind("<Button-1>", lambda e: self._switch_to_auto_detect())
+
+    def _switch_to_auto_detect(self):
+        save_defaults(dest_mode="auto")
+        self._detect_and_show()
 
     def _browse_dest(self):
         d = filedialog.askdirectory(title="Select destination device or folder")
@@ -524,15 +586,17 @@ class App:
                 "Continue anyway?")
             if not result:
                 return
-        self._open_with_dest(d)
+        self._start_setup(d, "manual")
 
-    def _open_with_dest(self, dest):
+    def _start_setup(self, dest: str, dest_mode: str):
         defaults = load_defaults()
         source = defaults.get("source") or _default_source()
-        self._open_workspace(source, dest)
+        playlist_folder = defaults.get("playlist_folder") or DEFAULT_PLAYLIST_FOLDER
+        self._open_workspace(source, dest, playlist_folder=playlist_folder, dest_mode=dest_mode)
 
     def _show_settings(self):
         """Unified settings screen — used both for initial setup and in-app config."""
+        self._stop_setup_polling()
         for w in self.root.winfo_children():
             w.destroy()
         self.root.config(menu=tk.Menu(self.root))
@@ -573,17 +637,38 @@ class App:
         row += 1
 
         # ── Dest ──
+        cur_dest_mode = self.dest_mode if is_open else defaults.get("dest_mode", "auto")
+        cur_manual_dest = (self.dest if is_open and cur_dest_mode == "manual"
+                           else defaults.get("dest", "") if defaults.get("dest_mode") == "manual" else "")
+        self._dest_manual_cache = cur_manual_dest
+
         ttk.Label(frame, text="DEST").grid(row=row, column=0, sticky="w", pady=(4, 0))
-        self._dest_var = tk.StringVar(value=cur_dest)
+        init_dest_text = "Device (Auto-Detect)" if cur_dest_mode == "auto" else cur_manual_dest
+        self._dest_var = tk.StringVar(value=init_dest_text)
         dest_row = ttk.Frame(frame)
         dest_row.grid(row=row, column=1, columnspan=2, sticky="ew", padx=5, pady=(4, 0))
-        ttk.Entry(dest_row, textvariable=self._dest_var, width=32).pack(side="left", fill="x", expand=True)
-        ttk.Button(dest_row, text="...", width=3,
-                    command=lambda: self._browse_var(self._dest_var, "Select destination device or folder")).pack(side="left", padx=(4, 0))
+        self._dest_entry = ttk.Entry(dest_row, textvariable=self._dest_var, width=32)
+        self._dest_entry.pack(side="left", fill="x", expand=True)
+        self._dest_browse_btn = ttk.Button(dest_row, text="...", width=3,
+                    command=lambda: self._browse_var(self._dest_var, "Select destination device or folder"))
+        self._dest_browse_btn.pack(side="left", padx=(4, 0))
+        if cur_dest_mode == "auto":
+            self._dest_entry.state(["disabled"])
+            self._dest_browse_btn.state(["disabled"])
         row += 1
+
         tk.Label(frame, text="Device or folder where playlists are stored",
                  font=("Consolas", 8), bg=BG, fg=FG_DIM, anchor="w").grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=(0, 5), pady=(0, 6))
+            row=row, column=0, columnspan=3, sticky="w", padx=(0, 5), pady=(0, 2))
+        row += 1
+
+        self._dest_auto_var = tk.BooleanVar(value=(cur_dest_mode == "auto"))
+        auto_cb = tk.Checkbutton(frame, text="Auto-detect device (Echo Mini)",
+                                  variable=self._dest_auto_var, command=self._toggle_dest_auto,
+                                  bg=BG, fg=FG, selectcolor=BG_INPUT,
+                                  activebackground=BG, activeforeground=FG,
+                                  font=("Consolas", 9))
+        auto_cb.grid(row=row, column=0, columnspan=3, sticky="w", padx=(0, 5), pady=(0, 6))
         row += 1
 
         # ── Separator ──
@@ -594,7 +679,8 @@ class App:
         # ── Playlist folder ──
         ttk.Label(frame, text="FOLDER").grid(row=row, column=0, sticky="w", pady=(4, 0))
         default_folder = (self.mgr.config.playlist_folder if is_open
-                          else existing_config.get("playlist_folder", DEFAULT_PLAYLIST_FOLDER))
+                          else defaults.get("playlist_folder")
+                          or existing_config.get("playlist_folder", DEFAULT_PLAYLIST_FOLDER))
         self._folder_var = tk.StringVar(value=default_folder)
         ttk.Entry(frame, textvariable=self._folder_var, width=20).grid(
             row=row, column=1, sticky="w", padx=5, pady=(4, 0))
@@ -651,12 +737,23 @@ class App:
         if d:
             var.set(d)
 
+    def _toggle_dest_auto(self):
+        if self._dest_auto_var.get():
+            cache = self._dest_var.get()
+            if cache != "Device (Auto-Detect)":
+                self._dest_manual_cache = cache
+            self._dest_var.set("Device (Auto-Detect)")
+            self._dest_entry.state(["disabled"])
+            self._dest_browse_btn.state(["disabled"])
+        else:
+            self._dest_entry.state(["!disabled"])
+            self._dest_browse_btn.state(["!disabled"])
+            self._dest_var.set(self._dest_manual_cache or "")
+
     def _on_settings_open(self):
         source = self._source_var.get().strip()
-        dest = self._dest_var.get().strip()
-        if not source or not dest:
-            messagebox.showwarning("Missing paths",
-                                    "Both source and destination are required.")
+        if not source:
+            messagebox.showwarning("Missing paths", "Source is required.")
             return
         folder = self._folder_var.get().strip() or DEFAULT_PLAYLIST_FOLDER
         try:
@@ -664,30 +761,50 @@ class App:
         except ValueError:
             interval = 5
 
+        if self._dest_auto_var.get():
+            dest_mode = "auto"
+            dest = _detect_echo_mini()
+            if not dest:
+                save_defaults(source, "", dest_mode="auto", playlist_folder=folder)
+                if self.mgr:
+                    self.mgr.release_lock()
+                    self.mgr = None
+                self.source = source
+                self._show_setup()
+                return
+        else:
+            dest_mode = "manual"
+            dest = self._dest_var.get().strip()
+            if not dest:
+                messagebox.showwarning("Missing paths",
+                                        "Both source and destination are required.")
+                return
+
         if self.mgr:
             self.mgr.config.backup_interval = interval
             if folder != self.mgr.config.playlist_folder:
                 self.mgr.config.playlist_folder = folder
             self.mgr.config.save(self.mgr.writer)
 
-            new_source = source
-            new_dest = dest
-            if new_source != self.source or new_dest != self.dest:
+            if source != self.source or dest != self.dest or dest_mode != self.dest_mode:
                 self.mgr.release_lock()
-                self._open_workspace(new_source, new_dest,
+                self._open_workspace(source, dest,
                                      playlist_folder=folder,
-                                     backup_interval=interval)
+                                     backup_interval=interval,
+                                     dest_mode=dest_mode)
             else:
-                save_defaults(source, dest)
+                save_defaults(source, dest, dest_mode=dest_mode, playlist_folder=folder)
                 self._show_main()
         else:
             self._open_workspace(source, dest,
                                  playlist_folder=folder,
-                                 backup_interval=interval)
+                                 backup_interval=interval,
+                                 dest_mode=dest_mode)
 
     def _open_workspace(self, source: str, dest: str,
                         playlist_folder: str = DEFAULT_PLAYLIST_FOLDER,
-                        backup_interval: int = 5):
+                        backup_interval: int = 5,
+                        dest_mode: str = "auto"):
         try:
             playlists_dir = Path(dest) / playlist_folder
             config_file = playlists_dir / ".echolist" / "config.json"
@@ -702,23 +819,25 @@ class App:
                     mgr.config.save(mgr.writer)
             else:
                 snapshot = PlaylistManager.find_snapshot(dest, playlist_folder=playlist_folder)
-                if snapshot and self._offer_snapshot_restore(snapshot, source, dest):
+                if snapshot and self._offer_snapshot_restore(snapshot, source, dest, dest_mode=dest_mode):
                     return
                 mgr = PlaylistManager.init(
                     source, dest,
                     playlist_folder=playlist_folder,
                     backup_interval=backup_interval,
                 )
-            save_defaults(source, dest)
+            save_defaults(source, dest, dest_mode=dest_mode, playlist_folder=playlist_folder)
         except WorkspaceLockError as e:
             messagebox.showerror("Workspace locked", str(e))
             return
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
+        self._stop_setup_polling()
         self.mgr = mgr
         self.source = source
         self.dest = dest
+        self.dest_mode = dest_mode
         self.root.unbind("<Return>")
 
         incomplete = SyncJournal.load_incomplete()
@@ -757,7 +876,8 @@ class App:
 
         self._show_main()
 
-    def _offer_snapshot_restore(self, snapshot: dict, source: str, dest: str) -> bool:
+    def _offer_snapshot_restore(self, snapshot: dict, source: str, dest: str,
+                                dest_mode: str = "auto") -> bool:
         """Show restore dialog. Returns True if restore was accepted (and workspace opened)."""
         store_data = snapshot.get("store", {})
         playlists = store_data.get("playlists", {})
@@ -797,14 +917,16 @@ class App:
                 playlist_folder=snap_folder,
                 backup_interval=snap_config.get("backup_interval", 5),
             )
-            save_defaults(snap_source, dest)
+            save_defaults(snap_source, dest, dest_mode=dest_mode, playlist_folder=snap_folder)
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return False
 
+        self._stop_setup_polling()
         self.mgr = mgr
         self.source = snap_source
         self.dest = dest
+        self.dest_mode = dest_mode
         self.root.unbind("<Return>")
 
         missing_sources = []
@@ -914,7 +1036,9 @@ class App:
         pl_header.pack(fill="x", padx=4, pady=(4, 2))
         ttk.Label(pl_header, text="PLAYLISTS", style="Section.TLabel").pack(side="left")
         ttk.Button(pl_header, text="+ New", command=self._create_playlist).pack(side="right", padx=(4, 0))
-        ttk.Button(pl_header, text="Spotify", command=self._open_spotify_window).pack(side="right", padx=(4, 0))
+        # TODO: SpotiFLAC integration disabled for release — legal risk (DMCA exposure,
+        # see Deezloader/Deemix precedent). Re-enable once a decision is made.
+        # ttk.Button(pl_header, text="Spotify", command=self._open_spotify_window).pack(side="right", padx=(4, 0))
         ttk.Button(pl_header, text=".m3u", command=self._import_m3u_dialog).pack(side="right", padx=(4, 0))
         ttk.Button(pl_header, text="Delete", command=self._delete_playlist).pack(side="right")
 
@@ -1156,13 +1280,15 @@ class App:
         menubar.add_cascade(label="Playlists", menu=self._playlists_menu)
         self._refresh_playlists_menu()
 
-        tools_menu = tk.Menu(menubar, tearoff=0, bg=BG_PANEL, fg=FG,
-                             activebackground=RED_DARK, activeforeground=FG_BRIGHT)
-        tools_menu.add_command(label="Spotify Download...",
-                              command=self._open_spotify_window,
-                              accelerator="Ctrl+Shift+S")
-        self.root.bind("<Control-Shift-S>", lambda e: self._open_spotify_window())
-        menubar.add_cascade(label="Tools", menu=tools_menu)
+        # TODO: SpotiFLAC integration disabled for release — legal risk (DMCA exposure,
+        # see Deezloader/Deemix precedent). Re-enable once a decision is made.
+        # tools_menu = tk.Menu(menubar, tearoff=0, bg=BG_PANEL, fg=FG,
+        #                      activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+        # tools_menu.add_command(label="Spotify Download...",
+        #                       command=self._open_spotify_window,
+        #                       accelerator="Ctrl+Shift+S")
+        # self.root.bind("<Control-Shift-S>", lambda e: self._open_spotify_window())
+        # menubar.add_cascade(label="Tools", menu=tools_menu)
 
     def _set_ui_locked(self, locked: bool):
         state = "disabled" if locked else "!disabled"
@@ -1652,10 +1778,201 @@ class App:
             menu.add_command(label=offload_label,
                             command=lambda: self._offload_playlist(iid),
                             state="normal" if can_offload else "disabled")
+        menu.add_command(label="Open in File Browser",
+                        command=lambda: self._open_playlist_location(iid))
+        menu.add_command(label="Export .m3u...",
+                        command=lambda: self._export_playlist_m3u(iid))
+        menu.add_command(label="Reload from .m3u...",
+                        command=lambda: self._reload_playlist_from_m3u(iid),
+                        state="disabled" if is_offloaded else "normal")
         menu.add_separator()
         menu.add_command(label="Rename", command=lambda: self._start_inline_rename(iid))
         menu.add_command(label="Delete", command=self._delete_playlist)
         self._show_popup_menu(menu, event)
+
+    def _open_playlist_location(self, pid: str):
+        pl = self.mgr.store.playlists.get(pid)
+        if not pl:
+            return
+        folder = self.mgr.writer.root / pl["folder"]
+        if not folder.exists():
+            messagebox.showerror("Not found", f"Playlist folder not found:\n{folder}")
+            return
+        _open_in_file_browser(folder)
+
+    def _export_playlist_m3u(self, pid: str):
+        """Export a playlist as a .m3u8 referencing the SOURCE library files
+        (not the device copies) using absolute paths, so it resolves no
+        matter where the file is saved or what opens it — a text editor,
+        VLC, or EchoList's own reimport."""
+        pl = self.mgr.store.playlists.get(pid)
+        if not pl:
+            return
+        full_tracks, _removed = self.staging.virtual_tracks(pid, pl.get("tracks", []))
+        if not full_tracks:
+            messagebox.showinfo("Empty playlist", f"'{pl['name']}' has no tracks to export.")
+            return
+
+        default_name = sanitize(pl["name"]) + ".m3u8"
+        f = filedialog.asksaveasfilename(
+            title="Export playlist as .m3u",
+            initialfile=default_name,
+            defaultextension=".m3u8",
+            filetypes=[("M3U8 playlist", "*.m3u8"), ("M3U playlist", "*.m3u")],
+        )
+        if not f:
+            return
+
+        source_root = Path(self.mgr.config.source_root).resolve()
+        lines = ["#EXTM3U", f"#PLAYLIST:{pl['name']}"]
+        skipped = []
+        for t in full_tracks:
+            src_path = t.get("src_path", "")
+            full = _resolve_source_file(src_path, source_root) if src_path else None
+            if not full:
+                skipped.append(src_path or "(no source recorded)")
+                continue
+            title, artist = _read_tags_from_file(full)
+            label = f"{artist} - {title}" if artist else title
+            lines.append(f"#EXTINF:-1,{label}")
+            lines.append(full.as_posix())
+
+        try:
+            Path(f).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as e:
+            messagebox.showerror("Export failed", str(e))
+            return
+
+        msg = f"Exported {len(full_tracks) - len(skipped)} track(s) to:\n{f}"
+        if skipped:
+            n = len(skipped)
+            sample = "\n".join(f"  - {s}" for s in skipped[:10])
+            if n > 10:
+                sample += f"\n  ... and {n - 10} more"
+            msg += f"\n\n{n} track(s) skipped (source file not found):\n{sample}"
+        messagebox.showinfo("Export complete", msg)
+
+    def _reload_playlist_from_m3u(self, pid: str):
+        """Replace a playlist's track list/order to match an (edited) .m3u file.
+
+        Diffs against the current staged view and stages adds/removes/reorder
+        to match — reviewable and undoable, nothing touches disk until Sync.
+        """
+        if self._syncing:
+            return
+        pl = self.mgr.store.playlists.get(pid)
+        if not pl:
+            return
+        if pl.get("offloaded"):
+            messagebox.showinfo("Playlist offloaded",
+                                "Onload this playlist before reloading it from a file.")
+            return
+
+        f = filedialog.askopenfilename(
+            title="Reload playlist from .m3u",
+            filetypes=[("M3U playlists", "*.m3u *.m3u8"), ("All files", "*.*")],
+            initialdir=self.source or str(Path.home()),
+        )
+        if not f:
+            return
+
+        source_root = Path(self.mgr.config.source_root).resolve()
+        result = parse_m3u(Path(f), source_root=source_root)
+        new_tracks = result["tracks"]
+        missing = result["missing"]
+        if not new_tracks:
+            messagebox.showwarning("No tracks found",
+                                    f"'{Path(f).name}' has no resolvable tracks. Nothing changed.")
+            return
+
+        name = pl["name"]
+        confirm = messagebox.askyesno(
+            "Reload playlist",
+            f"Replace the contents of '{name}' with {len(new_tracks)} track(s) "
+            f"from '{Path(f).name}'?\n\n"
+            f"This stages the changes — nothing is written to the device until Sync.",
+        )
+        if not confirm:
+            return
+
+        def _abs_of(t):
+            sp = t.get("src_path", "")
+            full = _resolve_source_file(sp, source_root) if sp else None
+            return full.resolve() if full else None
+
+        committed = pl.get("tracks", [])
+        current, _ = self.staging.virtual_tracks(pid, committed)
+        current_by_abs = {}
+        for t in current:
+            a = _abs_of(t)
+            if a and a not in current_by_abs:
+                current_by_abs[a] = t
+
+        new_abs_list = [np.resolve() for np in new_tracks]
+        new_abs_set = set(new_abs_list)
+
+        # Snapshot this playlist's staged state so the whole reload can be undone atomically.
+        prev_adds = [dict(a) for a in self.staging.pending_adds if a["pid"] == pid]
+        prev_removes = [dict(r) for r in self.staging.pending_removes if r["pid"] == pid]
+        prev_reorder = self.staging.pending_reorders.get(pid)
+        prev_reorder = list(prev_reorder) if prev_reorder is not None else None
+
+        orphans_removed = 0
+        for t in current:
+            a = _abs_of(t)
+            if a in new_abs_set:
+                continue
+            if t["_key"].startswith("c:"):
+                orig_idx = int(t["_key"].split(":")[1])
+                self.staging.stage_remove(pid, orig_idx, t.get("copy_name", ""))
+                if not t.get("src_path"):
+                    orphans_removed += 1
+
+        self.staging.pending_adds = [
+            a for a in self.staging.pending_adds
+            if not (a["pid"] == pid and Path(a["src"]).resolve() not in new_abs_set)
+        ]
+        self.staging.save()
+
+        for np in new_tracks:
+            a = np.resolve()
+            if a not in current_by_abs:
+                title, artist = _read_tags_from_file(np)
+                self.staging.stage_add(pid, str(np), title, artist)
+
+        final_current, _ = self.staging.virtual_tracks(pid, committed)
+        final_by_abs = {}
+        for t in final_current:
+            a = _abs_of(t)
+            if a:
+                final_by_abs[a] = t
+        new_order = [{"key": final_by_abs[a]["_key"]} for a in new_abs_list if a in final_by_abs]
+        self.staging.set_reorder(pid, new_order)
+
+        self._undo_stack.append({
+            "type": "reload_playlist",
+            "pid": pid,
+            "prev_adds": prev_adds,
+            "prev_removes": prev_removes,
+            "prev_reorder": prev_reorder,
+            "desc": f"Reload '{name}' from {Path(f).name}",
+        })
+
+        self._invalidate_caches(pid)
+        self._refresh_playlists()
+        self._refresh_tracks()
+        self._update_status()
+
+        parts = [f"Staged {len(new_tracks)} track(s) for '{name}'."]
+        if missing:
+            n = len(missing)
+            sample = "\n".join(f"  - {s}" for s in missing[:10])
+            if n > 10:
+                sample += f"\n  ... and {n - 10} more"
+            parts.append(f"{n} entry(ies) in the file could not be found and were skipped:\n{sample}")
+        if orphans_removed:
+            parts.append(f"{orphans_removed} removed track(s) had no source file (permanent).")
+        messagebox.showinfo("Reload staged", "\n\n".join(parts))
 
     def _reindex_playlist(self, pid: str):
         pl = self.mgr.store.playlists.get(pid)
@@ -1948,6 +2265,21 @@ class App:
             if pid in self.staging.pending_reorders:
                 del self.staging.pending_reorders[pid]
                 self.staging.save()
+        elif action["type"] == "reload_playlist":
+            pid = action["pid"]
+            self.staging.pending_adds = (
+                [a for a in self.staging.pending_adds if a["pid"] != pid] + action["prev_adds"]
+            )
+            self.staging.pending_removes = (
+                [r for r in self.staging.pending_removes if r["pid"] != pid] + action["prev_removes"]
+            )
+            if action["prev_reorder"] is not None:
+                self.staging.pending_reorders[pid] = action["prev_reorder"]
+            else:
+                self.staging.pending_reorders.pop(pid, None)
+            self.staging.save()
+            self._invalidate_caches(pid)
+            self._refresh_playlists()
 
         self._refresh_tracks()
         self._update_status()
@@ -2610,16 +2942,18 @@ class App:
 
     # ── .m3u import ──
 
-    def _open_spotify_window(self):
-        if hasattr(self, "_spotify_window") and self._spotify_window:
-            try:
-                self._spotify_window.win.deiconify()
-                self._spotify_window.win.lift()
-                return
-            except tk.TclError:
-                self._spotify_window = None
-        from .spotiflac_ui import SpotiFLACWindow
-        self._spotify_window = SpotiFLACWindow(self)
+    # TODO: SpotiFLAC integration disabled for release — legal risk (DMCA exposure,
+    # see Deezloader/Deemix precedent). Re-enable once a decision is made.
+    # def _open_spotify_window(self):
+    #     if hasattr(self, "_spotify_window") and self._spotify_window:
+    #         try:
+    #             self._spotify_window.win.deiconify()
+    #             self._spotify_window.win.lift()
+    #             return
+    #         except tk.TclError:
+    #             self._spotify_window = None
+    #     from .spotiflac_ui import SpotiFLACWindow
+    #     self._spotify_window = SpotiFLACWindow(self)
 
     def _import_m3u_dialog(self):
         """Open a file picker to import .m3u/.m3u8 playlists."""

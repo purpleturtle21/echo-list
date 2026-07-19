@@ -1,3 +1,23 @@
+# What's New in v0.2.1
+
+## Your device is found automatically
+No more hitting Retry — plug in your Echo Mini and EchoList picks it up on its own within a couple seconds.
+
+## Settings actually stick now
+Your folder name and backup interval used to reset every time you closed and reopened the app on Linux. Fixed — your setup is remembered.
+
+## Export playlists to .m3u, edit them, load them back
+Export a playlist to a real `.m3u` file with correct tags and paths, tweak it in any text editor or another player, then reload it back into EchoList. Your edits (reorders, adds, removes) get applied automatically, and it's a single undo if you change your mind.
+
+## Open a playlist's folder directly
+Right-click any playlist and choose "Open in File Browser" to jump straight to its files on the device.
+
+## Accurate track counts
+Fixed a bug where the device could report hundreds of tracks that weren't actually there.
+
+## Update flow fixed on Linux/macOS
+The in-app updater's restart step had a bug that could prevent it from finishing on Linux and macOS. Fixed.
+
 # What's New in v0.2
 
 ## Faster playlist switching

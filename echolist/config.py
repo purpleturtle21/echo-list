@@ -32,11 +32,28 @@ def load_defaults() -> dict:
     return {}
 
 
-def save_defaults(source: str, dest: str) -> None:
-    _atomic_write_text(DEFAULT_FILE, json.dumps({
-        "source": str(Path(source).resolve()),
-        "dest": str(Path(dest).resolve()),
-    }))
+def save_defaults(source: str = "", dest: str = "", dest_mode: str | None = None,
+                  playlist_folder: str | None = None) -> None:
+    """Merge-save persistent defaults (~/.echolist/default.json).
+
+    dest_mode is "auto" (auto-detect the device on launch, ignore any
+    stored dest) or "manual" (always use the stored dest). playlist_folder
+    is the workspace folder name on the device — needed so a restart can
+    find an existing (possibly non-default-named) workspace instead of
+    silently re-initializing an empty one under the default name. Merges
+    with whatever is already on disk so a partial call (e.g. just
+    switching dest_mode) doesn't clobber the other fields.
+    """
+    data = load_defaults()
+    if source:
+        data["source"] = str(Path(source).resolve())
+    if dest:
+        data["dest"] = str(Path(dest).resolve())
+    if dest_mode is not None:
+        data["dest_mode"] = dest_mode
+    if playlist_folder is not None:
+        data["playlist_folder"] = playlist_folder
+    _atomic_write_text(DEFAULT_FILE, json.dumps(data))
 
 
 # ── Metadata backups (stored in ~/.echolist/backups/) ──

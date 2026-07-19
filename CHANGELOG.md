@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.1
+
+### Setup & Settings
+- Device auto-detection now polls every 2s instead of requiring manual "Retry" — the app picks up the Echo Mini as soon as it's connected.
+- Setup/settings choices (auto-detect vs. manual destination, playlist folder name, backup interval) now persist across restarts. Previously the "folder" and "backup every" fields silently reset to defaults on every relaunch on Linux.
+- Settings screen has an explicit "Auto-detect device" checkbox; switching to a manual destination is a first-class, reversible choice instead of an implicit side effect.
+- Fixed a visual flicker on the setup screen's Retry/Browse buttons while polling for the device.
+
+### Playlists
+- **`.m3u`/`.m3u8` export**: writes real tags read from each file (not the possibly-stale/missing store metadata) and absolute paths, so the exported file is portable to any player or editor.
+- **Reload from `.m3u`**: edit an exported playlist file externally (reorder, remove, add tracks) and reload it back into EchoList — diffs against the current playlist and stages adds/removes/reorders accordingly. Undoable as a single action.
+- Right-click a playlist → **Open in File Browser** to jump straight to its folder on the device.
+
+### Bug Fixes
+- Device track count on the setup/main screen no longer counts files from sibling folders on the same drive — a "400+ tracks" report for a 6-track device was one `.parent` too many when resolving the device root.
+- Auto-updater: the Linux/macOS update-and-restart step called `chmod` on a `Path` object that had already been renamed away, raising `FileNotFoundError` before the app could relaunch. The self-update flow was broken on every non-Windows platform; now fixed and covered by tests.
+- `.m3u` parser falls back to cp1252 for Windows-authored files containing en-dashes and other special characters that aren't valid UTF-8.
+- Fuzzy filename matching when resolving `.m3u` entries and source files with smart quotes/unicode variants.
+
+### Tests
+- 239 tests passing.
+- New regression tests for every fix above, each verified to fail against the pre-fix code.
+- New dedicated dev sandbox (`dev-data/`, `scripts/dev-run.sh`, `scripts/seed_dev_library.py`) for exercising the real GUI against disposable local data, with real-device auto-detection explicitly disabled — keeps local testing from ever touching a real connected device.
+
 ## v0.2.0
 
 ### Thread Safety & Performance

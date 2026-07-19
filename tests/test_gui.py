@@ -677,6 +677,125 @@ class TestM3uImport:
         assert (app.mgr.writer.root / folder / tracks[0]["copy_name"]).exists()
 
 
+class TestPlaylistExport:
+    def test_export_uses_absolute_source_paths(self, app, gui_env):
+        """Export must write resolvable absolute paths, not paths relative to
+        source_root — those only resolve when reimported into EchoList or
+        when the .m3u happens to be saved inside the source library itself."""
+        pid = app.mgr.create_playlist("Trip")
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app.mgr.add_track(pid, src)
+
+        out = gui_env["tmp"] / "export.m3u8"
+        with patch("echolist.gui.filedialog.asksaveasfilename", return_value=str(out)), \
+             patch("echolist.gui.messagebox.showinfo"):
+            app._export_playlist_m3u(pid)
+
+        lines = out.read_text(encoding="utf-8").splitlines()
+        assert str(src.resolve()) in lines
+        assert "ArtistA/Album1/01 Song One.flac" not in lines
+
+    def test_export_reads_real_tags_for_committed_tracks(self, app, gui_env):
+        """Regression: committed (synced) tracks don't store title/artist in
+        the playlist store at all — export must read real embedded tags
+        rather than falling back to an empty artist + filename stem."""
+        pid = app.mgr.create_playlist("Tagged")
+        src = gui_env["src"] / "ArtistB" / "Album2" / "03 Song Two.flac"
+        app.mgr.add_track(pid, src)
+
+        out = gui_env["tmp"] / "tagged.m3u8"
+        with patch("echolist.gui.filedialog.asksaveasfilename", return_value=str(out)), \
+             patch("echolist.gui.messagebox.showinfo"):
+            app._export_playlist_m3u(pid)
+
+        content = out.read_text(encoding="utf-8")
+        assert "#EXTINF:-1,ArtistB - Song Two" in content
+
+    def test_export_reports_missing_source_by_name(self, app, gui_env):
+        """The 'skipped' message must name exactly which source file is missing."""
+        pid = app.mgr.create_playlist("Broken")
+        good = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app.staging.stage_add(pid, str(good), "Song One", "ArtistA")
+        ghost = str(gui_env["src"] / "gone" / "missing.flac")
+        app.staging.stage_add(pid, ghost, "Ghost", "Nobody")
+
+        out = gui_env["tmp"] / "broken.m3u8"
+        with patch("echolist.gui.filedialog.asksaveasfilename", return_value=str(out)), \
+             patch("echolist.gui.messagebox.showinfo") as mock_info:
+            app._export_playlist_m3u(pid)
+
+        msg = mock_info.call_args[0][1]
+        assert "1 track(s) skipped" in msg
+        assert ghost in msg
+
+    def test_export_empty_playlist_shows_info(self, app, gui_env):
+        pid = app.mgr.create_playlist("Empty")
+        with patch("echolist.gui.messagebox.showinfo") as mock_info:
+            app._export_playlist_m3u(pid)
+        assert "no tracks to export" in mock_info.call_args[0][1]
+
+
+class TestPlaylistReload:
+    def test_reload_diffs_add_remove_reorder(self, app, gui_env):
+        """Reloading from an edited .m3u must add/remove/reorder to match —
+        not just append, and not wholesale-replace losing undo-ability."""
+        pid = app.mgr.create_playlist("Trip")
+        a = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        b = gui_env["src"] / "ArtistB" / "Album2" / "03 Song Two.flac"
+        c = gui_env["src"] / "ArtistC" / "Album3" / "05 Song Three.flac"
+        app.mgr.add_track(pid, a)
+        app.mgr.add_track(pid, b)
+
+        m3u = gui_env["tmp"] / "edited.m3u8"
+        # New order: b, then c (newly added) — a is dropped.
+        m3u.write_text(
+            f"#EXTM3U\n{b.resolve().as_posix()}\n{c.resolve().as_posix()}\n",
+            encoding="utf-8",
+        )
+
+        with patch("echolist.gui.filedialog.askopenfilename", return_value=str(m3u)), \
+             patch("echolist.gui.messagebox.askyesno", return_value=True), \
+             patch("echolist.gui.messagebox.showinfo"):
+            app._reload_playlist_from_m3u(pid)
+
+        source_root = Path(app.mgr.config.source_root).resolve()
+        virtual, _ = app.staging.virtual_tracks(pid, app.mgr.store.playlists[pid]["tracks"])
+        resolved = [_resolve_source_file(t["src_path"], source_root).resolve() for t in virtual]
+        assert resolved == [b.resolve(), c.resolve()]
+        assert any(r["pid"] == pid for r in app.staging.pending_removes)
+
+    def test_reload_undo_restores_prior_state(self, app, gui_env):
+        pid = app.mgr.create_playlist("Trip")
+        a = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        b = gui_env["src"] / "ArtistB" / "Album2" / "03 Song Two.flac"
+        app.mgr.add_track(pid, a)
+        app.mgr.add_track(pid, b)
+
+        m3u = gui_env["tmp"] / "edited2.m3u8"
+        m3u.write_text(f"#EXTM3U\n{b.resolve().as_posix()}\n", encoding="utf-8")
+
+        with patch("echolist.gui.filedialog.askopenfilename", return_value=str(m3u)), \
+             patch("echolist.gui.messagebox.askyesno", return_value=True), \
+             patch("echolist.gui.messagebox.showinfo"):
+            app._reload_playlist_from_m3u(pid)
+        assert len(app.staging.pending_removes) == 1
+
+        app._do_undo()
+
+        assert len(app.staging.pending_removes) == 0
+        assert len(app.staging.pending_adds) == 0
+        assert pid not in app.staging.pending_reorders
+
+    def test_reload_offloaded_playlist_shows_info(self, app, gui_env):
+        pid = app.mgr.create_playlist("Frozen")
+        app.mgr.store.playlists[pid]["offloaded"] = True
+
+        with patch("echolist.gui.messagebox.showinfo") as mock_info:
+            app._reload_playlist_from_m3u(pid)
+
+        assert "Onload" in mock_info.call_args[0][1]
+
+
 class TestPlaylistRename:
     """Test inline rename and its interaction with backups."""
 
@@ -985,6 +1104,8 @@ class TestSourceRoot:
         a._stats_pending = False
         a._alive = True
         a._syncing = False
+        a._setup_polling = False
+        a._setup_poll_id = None
         a._apply_theme()
 
         a._open_workspace(str(new_src), str(dest))
@@ -1030,6 +1151,8 @@ class TestSourceRoot:
         a._stats_pending = False
         a._alive = True
         a._syncing = False
+        a._setup_polling = False
+        a._setup_poll_id = None
         a._apply_theme()
 
         a._open_workspace(str(src), str(dest))
@@ -1082,6 +1205,8 @@ class TestSourceRoot:
         a._stats_pending = False
         a._alive = True
         a._syncing = False
+        a._setup_polling = False
+        a._setup_poll_id = None
         a._apply_theme()
 
         a._open_workspace(str(new_src), str(dest))
@@ -1098,6 +1223,82 @@ class TestSourceRoot:
         config_path = dest / "Playlists" / ".echolist" / "config.json"
         saved = json.loads(config_path.read_text(encoding="utf-8"))
         assert saved["source_root"] == str(new_src.resolve())
+
+
+class TestRestartPersistence:
+    """Regression: closing and relaunching the app must reopen the SAME
+    workspace with its real settings intact, not silently init a fresh one.
+
+    Root cause was that ~/.echolist/default.json never remembered a custom
+    playlist_folder — only source/dest. On relaunch, the setup screen's
+    Start button always opened the DEFAULT-named folder, didn't find a
+    config.json there, and silently created a brand-new empty workspace —
+    resetting both 'folder' and 'backup every' to their defaults, even
+    though the real workspace (under its real folder name) was untouched.
+    """
+
+    def _new_app(self):
+        a = App.__new__(App)
+        a.root = tk.Tk()
+        a.root.withdraw()
+        a.mgr = None
+        a.source = ""
+        a.dest = ""
+        a.dest_mode = "auto"
+        a.current_pid = None
+        a.staging = StagingState.__new__(StagingState)
+        a.staging.pending_adds = []
+        a.staging.pending_removes = []
+        a.staging.pending_reorders = {}
+        a._undo_stack = []
+        a._sort_col = None
+        a._sort_reverse = False
+        a._drag_data = None
+        a._cached_device_tracks = 0
+        a._cached_workspace_bytes = 0
+        a._stats_pending = False
+        a._alive = True
+        a._syncing = False
+        a._setup_polling = False
+        a._setup_poll_id = None
+        a._apply_theme()
+        return a
+
+    def _teardown(self, a):
+        a._alive = False
+        t = getattr(a, "_stats_thread", None)
+        if t:
+            t.join(timeout=5)
+        _flush_bg_ops(a, timeout=5)
+        a.root.destroy()
+
+    def test_restart_reopens_existing_workspace_with_custom_folder(self, tmp_path, monkeypatch):
+        src = tmp_path / "library"
+        _make_flac(src / "ArtistA" / "Album1" / "01 Song One.flac", "ArtistA", "Song One")
+        dest = tmp_path / "card"
+        dest.mkdir()
+
+        test_pending = tmp_path / "pending.json"
+        monkeypatch.setattr("echolist.gui.PENDING_FILE", test_pending)
+
+        # First launch: configure a non-default folder name + backup interval.
+        a1 = self._new_app()
+        a1._open_workspace(str(src), str(dest), playlist_folder="MyTunes", backup_interval=10)
+        assert a1.mgr.config.playlist_folder == "MyTunes"
+        assert a1.mgr.config.backup_interval == 10
+        a1.mgr.release_lock()
+        self._teardown(a1)
+
+        # "Relaunch": a fresh App reads the saved defaults, exactly like
+        # clicking Start on the setup screen after reopening the app.
+        a2 = self._new_app()
+        a2._start_setup(str(dest), "manual")
+        assert a2.mgr is not None
+        assert a2.mgr.config.playlist_folder == "MyTunes"
+        assert a2.mgr.config.backup_interval == 10
+        assert not (dest / "Playlists").exists(), "phantom default-named workspace was created"
+        a2.mgr.release_lock()
+        self._teardown(a2)
 
 
 class TestReadTags:

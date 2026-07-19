@@ -101,6 +101,25 @@ def test_stats(manager, source):
     assert s["workspace_bytes"] > 0
 
 
+def test_device_tracks_excludes_sibling_directories(manager, source, dest):
+    """Regression: compute_expensive_stats scanned dest.parent.parent instead
+    of dest.parent, one directory level too high. On a real machine dest and
+    source both live under the same parent (e.g. dest is a mounted device
+    under /run/media/<user>/ alongside other drives, or — as here — source
+    and dest are siblings under the same tmp_path) so the bug counted audio
+    files across unrelated sibling directories, wildly inflating the
+    'TRACKS: X / 8192' figure shown in the UI.
+    """
+    pid = manager.create_playlist("S")
+    manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
+
+    device_tracks, _ = manager.compute_expensive_stats()
+
+    # Only the one copy inside dest should count — not the 3 originals
+    # sitting in the sibling `source` library.
+    assert device_tracks == 1
+
+
 def test_overlap_source_inside_workspace(tmp_path):
     """Source inside workspace must be rejected — workspace could overwrite originals."""
     workspace_parent = tmp_path / "card"

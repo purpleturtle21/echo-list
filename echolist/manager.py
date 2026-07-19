@@ -323,7 +323,7 @@ class PlaylistManager:
             )
         else:
             workspace_bytes = 0
-        device_root = self.writer.root.parent.parent
+        device_root = self.writer.root.parent
         device_tracks = _count_audio_files(device_root)
         return device_tracks, workspace_bytes
 

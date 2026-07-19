@@ -6,3 +6,4 @@ build/
 *.spec
 .pytest_cache/
 *.egg
+dev-data/

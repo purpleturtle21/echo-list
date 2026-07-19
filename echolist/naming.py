@@ -1,4 +1,5 @@
 """Sanitize names and filenames for exFAT/FAT-safe storage."""
+from __future__ import annotations
 
 import re
 from pathlib import Path
