@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .safe_write import SafeWriter, UnsafeWriteError
 from .config import (
-    Config, DEFAULT_PLAYLIST_FOLDER,
+    Config, DEFAULT_PLAYLIST_FOLDER, migrate_backups,
     save_backup, list_backups, list_all_backup_pids, load_backup,
     save_playlist_snapshot, load_playlist_snapshot,
 )
@@ -111,6 +111,45 @@ class PlaylistManager:
             except OSError:
                 pass
             self._lock_fd = None
+
+    def rename_workspace_folder(self, new_folder: str) -> None:
+        """Rename the on-disk workspace directory (the user changing
+        'playlist_folder' in Settings for an already-open workspace) and
+        migrate its backups, since they're keyed by a hash of this exact
+        path — otherwise a rename would silently orphan every existing
+        restore point and crash-recovery snapshot.
+
+        Releases and re-acquires the workspace lock around the rename: on
+        Windows, renaming a directory containing an open, locked file can
+        fail. If the rename itself fails, the old lock is re-acquired so
+        the workspace is left exactly as it was.
+
+        Callers must ensure no sync/write is in progress — PlaylistManager
+        has no internal "syncing" state of its own to check (that's
+        orchestrated by the GUI layer), so renaming out from under an
+        in-flight write is the caller's responsibility to prevent."""
+        old_root = self.writer.root
+        new_root = old_root.parent / new_folder
+        if new_root == old_root:
+            return
+        if new_root.exists():
+            raise FileExistsError(
+                f"A folder named '{new_folder}' already exists here.")
+
+        self.release_lock()
+        try:
+            old_root.rename(new_root)
+        except OSError:
+            self._acquire_lock()
+            raise
+
+        self.writer.root = new_root
+        self._acquire_lock()
+
+        migrate_backups(old_root, new_root)
+
+        self.config.playlist_folder = new_folder
+        self.config.save(self.writer)
 
     def create_playlist(self, name: str) -> str:
         pid = playlist_id(name)

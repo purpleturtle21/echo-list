@@ -6,7 +6,7 @@ import pytest
 from pathlib import Path
 from mutagen.flac import FLAC
 
-from echolist.manager import PlaylistManager
+from echolist.manager import PlaylistManager, WorkspaceLockError
 from echolist.safe_write import UnsafeWriteError
 from conftest import assert_originals_untouched
 
@@ -1201,3 +1201,89 @@ def test_rename_backup_restore_works(manager, source):
     # Verify tags were restored
     tags = read_playlist_tags(track_path)
     assert tags["album"] != "WRONG ALBUM"
+
+
+class TestRenameWorkspaceFolder:
+    """Regression: changing 'playlist_folder' in Settings for an
+    already-open workspace used to just flip the config field in memory —
+    the actual on-disk folder was never renamed, so config.json ended up
+    saved under the OLD folder claiming the NEW name, and the next launch
+    silently created a brand-new empty workspace at the new name while
+    every real playlist stayed orphaned under the old one."""
+
+    def test_renames_directory_and_preserves_content(self, manager, source, dest):
+        pid = manager.create_playlist("Workout")
+        manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
+        old_root = manager.writer.root
+
+        manager.rename_workspace_folder("MyTunes")
+
+        assert not old_root.exists()
+        new_root = dest / "MyTunes"
+        assert new_root.exists()
+        assert (new_root / "Workout").is_dir()
+        assert manager.writer.root == new_root
+
+    def test_updates_config_playlist_folder_and_persists_at_new_location(self, manager, dest):
+        manager.rename_workspace_folder("MyTunes")
+        assert manager.config.playlist_folder == "MyTunes"
+        manager.release_lock()
+
+        reopened = PlaylistManager.open(dest, playlist_folder="MyTunes")
+        assert reopened.config.playlist_folder == "MyTunes"
+        reopened.release_lock()
+
+    def test_raises_and_does_not_touch_anything_if_target_exists(self, manager, dest, source):
+        pid = manager.create_playlist("Workout")
+        manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
+        (dest / "MyTunes").mkdir()
+        old_root = manager.writer.root
+
+        with pytest.raises(FileExistsError):
+            manager.rename_workspace_folder("MyTunes")
+
+        assert old_root.exists()
+        assert (old_root / "Workout").is_dir()
+        assert manager.writer.root == old_root
+        assert manager.config.playlist_folder != "MyTunes"
+
+    def test_noop_when_name_unchanged(self, manager):
+        old_root = manager.writer.root
+        manager.rename_workspace_folder(old_root.name)
+        assert manager.writer.root == old_root
+
+    def test_migrates_backups_so_restore_points_survive_rename(self, manager, source, dest):
+        pid = manager.create_playlist("Workout")
+        manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
+        manager.backup_playlist_metadata(pid)
+        assert manager.has_metadata_backup(pid)
+
+        manager.rename_workspace_folder("MyTunes")
+
+        assert manager.has_metadata_backup(pid), \
+            "restore points became unreachable after the folder rename"
+
+    def test_still_locked_and_usable_after_rename(self, manager, source, dest):
+        """The lock is released and re-acquired around the rename — a
+        second instance must still be refused afterward, proving the new
+        location is actually locked (not silently left unlocked)."""
+        manager.rename_workspace_folder("MyTunes")
+
+        with pytest.raises(WorkspaceLockError):
+            PlaylistManager.open(dest, playlist_folder="MyTunes")
+
+    def test_rename_failure_reacquires_old_lock(self, manager, monkeypatch, dest):
+        """If the directory rename itself fails partway (e.g. device
+        removed), the workspace must not end up silently unlocked."""
+        old_root = manager.writer.root
+
+        def _boom(self, target):
+            raise OSError("simulated device removal")
+        monkeypatch.setattr(Path, "rename", _boom)
+
+        with pytest.raises(OSError):
+            manager.rename_workspace_folder("MyTunes")
+
+        assert manager.writer.root == old_root
+        with pytest.raises(WorkspaceLockError):
+            PlaylistManager.open(dest, playlist_folder=old_root.name)

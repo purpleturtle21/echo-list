@@ -1807,3 +1807,125 @@ class TestUpdateBanner:
         a._refresh_update_banner()  # must not raise
         assert a._setup_update_slot is None
         self._teardown(a)
+
+
+class TestSettingsRenameFolder:
+    """Regression: renaming the playlist folder via Settings for an
+    already-open workspace used to just flip config.playlist_folder in
+    memory without touching the actual directory on disk — the real
+    playlists stayed orphaned under the old folder name, and the next
+    launch silently created a brand-new empty workspace at the new name."""
+
+    def _new_app(self, gui_env):
+        from queue import Queue
+        a = App.__new__(App)
+        a.root = tk.Tk()
+        a.root.withdraw()
+        a.mgr = gui_env["mgr"]
+        a.source = str(gui_env["src"])
+        a.dest = str(gui_env["dest"])
+        a.dest_mode = "manual"
+        a.current_pid = None
+        a._syncing = False
+        a._alive = True
+        a._callback_queue = Queue()
+        a._apply_theme()
+        a._source_var = tk.StringVar(value=str(gui_env["src"]))
+        a._folder_var = tk.StringVar(value=a.mgr.config.playlist_folder)
+        a._backup_var = tk.StringVar(value=str(a.mgr.config.backup_interval))
+        a._dest_auto_var = tk.BooleanVar(value=False)
+        a._dest_var = tk.StringVar(value=str(gui_env["dest"]))
+        return a
+
+    def _teardown(self, a):
+        a.root.destroy()
+
+    def test_rename_moves_the_real_directory(self, gui_env, monkeypatch):
+        monkeypatch.setattr("echolist.gui.PENDING_FILE", gui_env["tmp"] / "pending.json")
+        a = self._new_app(gui_env)
+        pid = a.mgr.create_playlist("Workout")
+        a.mgr.add_track(pid, gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac")
+        old_root = a.mgr.writer.root
+        monkeypatch.setattr(a, "_show_main", lambda: None)
+
+        a._folder_var.set("MyTunes")
+        a._on_settings_open()
+
+        assert not old_root.exists()
+        new_root = gui_env["dest"] / "MyTunes"
+        assert new_root.exists()
+        assert (new_root / "Workout").is_dir()
+        assert a.mgr.config.playlist_folder == "MyTunes"
+        self._teardown(a)
+
+    def test_blocked_while_syncing(self, gui_env, monkeypatch):
+        monkeypatch.setattr("echolist.gui.PENDING_FILE", gui_env["tmp"] / "pending.json")
+        a = self._new_app(gui_env)
+        old_root = a.mgr.writer.root
+        a._syncing = True
+        monkeypatch.setattr(a, "_show_main", lambda: None)
+        warned = []
+        monkeypatch.setattr("echolist.gui.messagebox.showwarning",
+                             lambda *args, **kw: warned.append(True))
+
+        a._folder_var.set("MyTunes")
+        a._on_settings_open()
+
+        assert warned == [True]
+        assert old_root.exists()
+        assert a.mgr.config.playlist_folder != "MyTunes"
+        self._teardown(a)
+
+    def test_restart_after_rename_reopens_same_data(self, gui_env, monkeypatch):
+        """The real end-to-end proof: rename via Settings, then simulate a
+        restart the way TestRestartPersistence does — a fresh app reading
+        saved defaults must reopen the SAME renamed workspace, not a blank
+        one under either name."""
+        pending = gui_env["tmp"] / "pending.json"
+        monkeypatch.setattr("echolist.gui.PENDING_FILE", pending)
+        a = self._new_app(gui_env)
+        pid = a.mgr.create_playlist("Workout")
+        a.mgr.add_track(pid, gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac")
+        monkeypatch.setattr(a, "_show_main", lambda: None)
+
+        a._folder_var.set("MyTunes")
+        a._on_settings_open()
+        a.mgr.release_lock()
+        self._teardown(a)
+
+        b = App.__new__(App)
+        b.root = tk.Tk()
+        b.root.withdraw()
+        b.mgr = None
+        b.source = ""
+        b.dest = ""
+        b.dest_mode = "auto"
+        b.current_pid = None
+        b.staging = StagingState.__new__(StagingState)
+        b.staging.pending_adds = []
+        b.staging.pending_removes = []
+        b.staging.pending_reorders = {}
+        b._undo_stack = []
+        b._sort_col = None
+        b._sort_reverse = False
+        b._drag_data = None
+        b._cached_device_tracks = 0
+        b._cached_workspace_bytes = 0
+        b._stats_pending = False
+        b._alive = True
+        b._syncing = False
+        b._tag_cache = {}
+        b._audit_cache = {}
+        b._tracks_loading = False
+        b._tracks_gen = 0
+        b._setup_polling = False
+        b._setup_poll_id = None
+        b._apply_theme()
+        b._start_setup(str(gui_env["dest"]), "manual")
+
+        assert b.mgr is not None
+        assert b.mgr.config.playlist_folder == "MyTunes"
+        assert (gui_env["dest"] / "MyTunes" / "Workout").is_dir()
+        assert not (gui_env["dest"] / "Playlists").exists()
+        b.mgr.release_lock()
+        b.root.destroy()

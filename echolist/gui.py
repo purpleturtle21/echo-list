@@ -788,18 +788,31 @@ class App:
                 return
 
         if self.mgr:
-            self.mgr.config.backup_interval = interval
-            if folder != self.mgr.config.playlist_folder:
-                self.mgr.config.playlist_folder = folder
-            self.mgr.config.save(self.mgr.writer)
-
             if source != self.source or dest != self.dest or dest_mode != self.dest_mode:
+                self.mgr.config.backup_interval = interval
+                if folder != self.mgr.config.playlist_folder:
+                    self.mgr.config.playlist_folder = folder
+                self.mgr.config.save(self.mgr.writer)
                 self.mgr.release_lock()
                 self._open_workspace(source, dest,
                                      playlist_folder=folder,
                                      backup_interval=interval,
                                      dest_mode=dest_mode)
             else:
+                self.mgr.config.backup_interval = interval
+                if folder != self.mgr.config.playlist_folder:
+                    if self._syncing:
+                        messagebox.showwarning(
+                            "Sync in progress",
+                            "Can't rename the playlist folder while a sync "
+                            "is running. Wait for it to finish and try again.")
+                        return
+                    try:
+                        self.mgr.rename_workspace_folder(folder)
+                    except (FileExistsError, WorkspaceLockError, OSError) as e:
+                        messagebox.showerror("Rename failed", str(e))
+                        return
+                self.mgr.config.save(self.mgr.writer)
                 save_defaults(source, dest, dest_mode=dest_mode, playlist_folder=folder)
                 self._show_main()
         else:

@@ -56,6 +56,17 @@ def save_defaults(source: str = "", dest: str = "", dest_mode: str | None = None
     _atomic_write_text(DEFAULT_FILE, json.dumps(data))
 
 
+def migrate_backups(old_workspace_root: str | Path, new_workspace_root: str | Path) -> None:
+    """Move a workspace's backups directory to match a renamed workspace
+    path — backups are keyed by a hash of the absolute path, so renaming
+    the workspace folder without this orphans every restore point and
+    the crash-recovery snapshot under the old hash."""
+    old_dir = BACKUPS_ROOT / _workspace_id(old_workspace_root)
+    new_dir = BACKUPS_ROOT / _workspace_id(new_workspace_root)
+    if old_dir.exists() and not new_dir.exists():
+        old_dir.rename(new_dir)
+
+
 # ── Metadata backups (stored in ~/.echolist/backups/) ──
 
 def save_backup(workspace_root: str | Path, pid: str, timestamp: str, data: dict) -> Path:
