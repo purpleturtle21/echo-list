@@ -1687,6 +1687,8 @@ class TestUpdateBanner:
         a.root = tk.Tk()
         a.root.withdraw()
         a._update_info = None
+        a._update_checking = False
+        a._update_spinner_after_id = None
         a._apply_theme()
         a._setup_update_slot = ttk.Frame(a.root)
         a._setup_update_slot.pack()
@@ -1806,6 +1808,76 @@ class TestUpdateBanner:
                           "release_url": "https://x/rel"}
         a._refresh_update_banner()  # must not raise
         assert a._setup_update_slot is None
+        self._teardown(a)
+
+    def test_checking_indicator_shows_immediately(self, monkeypatch):
+        """The API call can take a few seconds — a "Checking for updates"
+        indicator must appear right away, before the network call resolves,
+        so the update banner's brief appearance isn't easy to miss."""
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: True)
+        monkeypatch.setattr("echolist.updater.check_for_update", lambda **kw: None)
+        a = self._new_app()
+
+        a._check_for_updates()
+
+        assert a._update_checking is True
+        children = a._setup_update_slot.winfo_children()
+        assert len(children) == 1
+        assert "Checking for updates" in a._update_spinner_label.cget("text")
+        self._teardown(a)
+
+    def test_checking_indicator_clears_when_no_update_found(self, monkeypatch):
+        from queue import Queue
+        a = self._new_app()
+        a._callback_queue = Queue()
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: True)
+
+        def fake_check(on_update_available=None, on_no_update=None, on_error=None):
+            on_no_update()
+        monkeypatch.setattr("echolist.updater.check_for_update", fake_check)
+
+        a._check_for_updates()
+        while not a._callback_queue.empty():
+            a._callback_queue.get_nowait()()
+
+        assert a._update_checking is False
+        assert len(a._setup_update_slot.winfo_children()) == 0
+        self._teardown(a)
+
+    def test_checking_indicator_clears_on_error(self, monkeypatch):
+        from queue import Queue
+        a = self._new_app()
+        a._callback_queue = Queue()
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: True)
+
+        def fake_check(on_update_available=None, on_no_update=None, on_error=None):
+            on_error("network down")
+        monkeypatch.setattr("echolist.updater.check_for_update", fake_check)
+
+        a._check_for_updates()
+        while not a._callback_queue.empty():
+            a._callback_queue.get_nowait()()
+
+        assert a._update_checking is False
+        assert len(a._setup_update_slot.winfo_children()) == 0
+        self._teardown(a)
+
+    def test_checking_indicator_replaced_by_banner_when_update_found(self, monkeypatch):
+        from queue import Queue
+        a = self._new_app()
+        a._callback_queue = Queue()
+        monkeypatch.setattr("echolist.updater._is_frozen", lambda: True)
+
+        def fake_check(on_update_available=None, on_no_update=None, on_error=None):
+            on_update_available("9.9.9", "https://x/bin", "https://x/rel")
+        monkeypatch.setattr("echolist.updater.check_for_update", fake_check)
+
+        a._check_for_updates()
+        while not a._callback_queue.empty():
+            a._callback_queue.get_nowait()()
+
+        assert a._update_checking is False
+        assert "9.9.9" in a._update_banner_label.cget("text")
         self._teardown(a)
 
 

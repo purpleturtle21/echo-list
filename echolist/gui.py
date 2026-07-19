@@ -347,6 +347,8 @@ class App:
         self._poll_callbacks()
         self._apply_theme()
         self._update_info = None
+        self._update_checking = False
+        self._update_spinner_after_id = None
         self._show_setup()
         self.root.after(1500, self._check_for_updates)
 
@@ -1169,11 +1171,19 @@ class App:
         it's the Python interpreter, and apply_update_and_restart would
         rename/chmod/exec THAT instead. So the "Update" button only appears
         when frozen (see _build_update_banner) — everyone else still sees
-        the version + Changelog link, just no self-update action."""
+        the version + Changelog link, just no self-update action.
+
+        The API call can take a few seconds; a "Checking for updates..."
+        indicator shows immediately so it isn't easy to miss the window
+        where the banner appears."""
         from .updater import check_for_update
+
+        self._update_checking = True
+        self._refresh_update_banner()
 
         def on_update(latest_ver, download_url, release_url):
             def _apply():
+                self._update_checking = False
                 self._update_info = {
                     "version": latest_ver,
                     "download_url": download_url,
@@ -1182,7 +1192,20 @@ class App:
                 self._refresh_update_banner()
             self._schedule_callback(_apply)
 
-        check_for_update(on_update_available=on_update)
+        def on_no_update():
+            def _apply():
+                self._update_checking = False
+                self._refresh_update_banner()
+            self._schedule_callback(_apply)
+
+        def on_error(msg):
+            def _apply():
+                self._update_checking = False
+                self._refresh_update_banner()
+            self._schedule_callback(_apply)
+
+        check_for_update(on_update_available=on_update, on_no_update=on_no_update,
+                         on_error=on_error)
 
     def _refresh_update_banner(self):
         slot = getattr(self, "_setup_update_slot", None)
@@ -1194,8 +1217,44 @@ class App:
         except tk.TclError:
             self._setup_update_slot = None
             return
+        self._stop_update_spinner()
         if self._update_info:
             self._build_update_banner(slot)
+        elif self._update_checking:
+            self._build_checking_indicator(slot)
+
+    def _build_checking_indicator(self, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        label = tk.Label(row, text="Checking for updates", font=("Consolas", 9),
+                          bg=BG, fg=FG_DIM, anchor="w")
+        label.pack(side="left")
+        self._update_spinner_label = label
+        self._update_spinner_frame = 0
+        self._tick_update_spinner()
+
+    def _tick_update_spinner(self):
+        label = getattr(self, "_update_spinner_label", None)
+        if label is None:
+            return
+        try:
+            dots = "." * (self._update_spinner_frame % 4)
+            label.config(text=f"Checking for updates{dots}")
+        except tk.TclError:
+            self._update_spinner_label = None
+            return
+        self._update_spinner_frame += 1
+        self._update_spinner_after_id = self.root.after(400, self._tick_update_spinner)
+
+    def _stop_update_spinner(self):
+        after_id = getattr(self, "_update_spinner_after_id", None)
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            self._update_spinner_after_id = None
+        self._update_spinner_label = None
 
     def _build_update_banner(self, parent):
         from .updater import _is_frozen
