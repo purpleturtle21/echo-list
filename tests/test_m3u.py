@@ -180,6 +180,44 @@ def test_parse_skips_semicolon_comments(music_lib, tmp_path):
     assert len(result["missing"]) == 0
 
 
+# ── Fuzzy character resolution ──
+
+def test_smart_apostrophe_in_filename_resolved_from_straight(tmp_path):
+    """A file with a curly apostrophe (’) should be found when the .m3u
+    uses a straight apostrophe (')."""
+    lib = tmp_path / "library"
+    _make_flac(lib / "Band" / "Album" / "01 Everybody’s Song.flac", "Band", "Everybody’s Song")
+    m3u = tmp_path / "test.m3u"
+    m3u.write_text("Band/Album/01 Everybody's Song.flac\n", encoding="utf-8")
+    result = parse_m3u(m3u, source_root=lib)
+    assert len(result["tracks"]) == 1
+    assert len(result["missing"]) == 0
+
+
+def test_straight_apostrophe_in_filename_resolved_from_smart(tmp_path):
+    """A file with a straight apostrophe should be found when the .m3u
+    uses a curly apostrophe."""
+    lib = tmp_path / "library"
+    _make_flac(lib / "Band" / "Album" / "01 Everybody's Song.flac", "Band", "Everybody's Song")
+    m3u = tmp_path / "test.m3u"
+    m3u.write_text("Band/Album/01 Everybody’s Song.flac\n", encoding="utf-8")
+    result = parse_m3u(m3u, source_root=lib)
+    assert len(result["tracks"]) == 1
+    assert len(result["missing"]) == 0
+
+
+def test_en_dash_in_filename_resolved_from_hyphen(tmp_path):
+    """A file with an en-dash (–) should be found when the .m3u uses a
+    regular hyphen."""
+    lib = tmp_path / "library"
+    _make_flac(lib / "Band" / "01 Track A – Part 1.flac", "Band", "Track A – Part 1")
+    m3u = tmp_path / "test.m3u"
+    m3u.write_text("Band/01 Track A - Part 1.flac\n", encoding="utf-8")
+    result = parse_m3u(m3u, source_root=lib)
+    assert len(result["tracks"]) == 1
+    assert len(result["missing"]) == 0
+
+
 # ── Name curation ──
 
 def test_curate_simple_name():

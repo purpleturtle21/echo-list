@@ -97,8 +97,7 @@ Requires a display server (X11 or Wayland with XWayland). If you get tkinter err
 
 ### macOS
 
-> macOS has not been tested. It may work but is not guaranteed. Apple Silicon only.
-
+> macOS has not been tested thoroughly. It may break. Latest tested release on macOS: v0.1.0
 ```bash
 # Download
 wget https://github.com/purpleturtle21/echo-list/releases/latest/download/echolist-macos-arm64
@@ -140,7 +139,7 @@ Yes — you can point it at any folder. It's useful for organizing music on SD c
 EchoList has a sync journal. On next launch it detects the interrupted sync and picks up where it left off.
 
 **I have playlists in MusicBee/foobar2000 — can I import them?**
-Yes. Export as `.m3u` from your player, then File → Import .m3u in EchoList.
+Yes. Export as `.m3u` from your player, then press the .m3u button in EchoList.
 
 ---
 

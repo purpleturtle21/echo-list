@@ -70,6 +70,19 @@ ALLOWED_EXCEPTIONS = {
     # journal.py writes ~/.echolist/sync_journal.json (user-local crash-recovery
     # state); .unlink() is for cleanup of the journal file on completion
     "journal.py": {"unlink"},
+    # spotiflac_ui.py writes ~/.echolist/spotiflac_settings.json (user-local),
+    # generates .m3u8 alongside downloads, copies files from temp to library
+    # in device-only mode, and cleans up temp dirs
+    "spotiflac_ui.py": {"write_text", "mkdir"},
+    # updater.py writes update binaries and manages ~/.echolist/packages;
+    # .unlink() removes old .exe after update; .rename() swaps executables
+    "updater.py": {"write_bytes", "mkdir", "unlink", "rename"},
+}
+
+ALLOWED_FUNCS = {
+    # spotiflac_ui.py copies downloaded files from temp to source library
+    # and cleans up temp dirs — neither touches the SafeWriter workspace
+    "spotiflac_ui.py": {"shutil.copy2", "shutil.rmtree"},
 }
 
 ALLOWED_OPEN = {"manager.py"}
@@ -96,7 +109,8 @@ def _collect_violations(filepath: Path) -> list[str]:
             # module.func calls like shutil.rmtree()
             if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
                 full = f"{func.value.id}.{func.attr}"
-                if full in FORBIDDEN_FUNCS:
+                allowed_funcs = ALLOWED_FUNCS.get(fname, set())
+                if full in FORBIDDEN_FUNCS and full not in allowed_funcs:
                     violations.append(
                         f"{fname}:{node.lineno} calls {full}()"
                     )

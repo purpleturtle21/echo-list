@@ -15,7 +15,7 @@ import string
 from datetime import datetime
 
 from .manager import PlaylistManager, WorkspaceLockError, AUDIO_EXTS
-from .naming import playlist_id, sanitize
+from .naming import playlist_id, sanitize, fuzzy_resolve
 from .config import load_defaults, save_defaults, DEFAULT_PLAYLIST_FOLDER
 from .journal import SyncJournal
 from .m3u import parse_m3u, curate_playlist_name
@@ -145,6 +145,12 @@ def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
             candidate = ancestor / p
             if candidate.exists():
                 return candidate.resolve()
+
+    # 3b. Fuzzy match (smart quotes, curly apostrophes, dashes, etc.)
+    if not p.is_absolute():
+        hit = fuzzy_resolve(source_root / p)
+        if hit and hit.is_file():
+            return hit.resolve()
 
     # 4. Filename search under source_root and its parent
     name = p.name
@@ -908,6 +914,7 @@ class App:
         pl_header.pack(fill="x", padx=4, pady=(4, 2))
         ttk.Label(pl_header, text="PLAYLISTS", style="Section.TLabel").pack(side="left")
         ttk.Button(pl_header, text="+ New", command=self._create_playlist).pack(side="right", padx=(4, 0))
+        ttk.Button(pl_header, text="Spotify", command=self._open_spotify_window).pack(side="right", padx=(4, 0))
         ttk.Button(pl_header, text=".m3u", command=self._import_m3u_dialog).pack(side="right", padx=(4, 0))
         ttk.Button(pl_header, text="Delete", command=self._delete_playlist).pack(side="right")
 
@@ -1007,12 +1014,72 @@ class App:
         if source_root.exists():
             self._populate_source_tree(source_root)
 
+        self.root.after(1000, self._check_for_updates)
+
+    def _check_for_updates(self):
+        from .updater import check_for_update, __version__
+
+        def on_update(latest_ver, download_url, release_url):
+            def _prompt():
+                result = messagebox.askyesno(
+                    "Update Available",
+                    f"EchoList v{latest_ver} is available (you have v{__version__}).\n\n"
+                    "Download and install the update?",
+                )
+                if result and download_url:
+                    self._download_update(download_url)
+            self._schedule_callback(_prompt)
+
+        check_for_update(on_update_available=on_update)
+
+    def _download_update(self, download_url):
+        from .updater import download_and_replace, apply_update_and_restart
+
+        self.pending_lbl.config(text="Downloading update...", fg=YELLOW)
+
+        def on_progress(msg):
+            self._schedule_callback(lambda: self.pending_lbl.config(text=msg, fg=YELLOW))
+
+        def on_done(current_exe, new_exe):
+            def _apply():
+                try:
+                    apply_update_and_restart(current_exe, new_exe)
+                except Exception as e:
+                    messagebox.showerror("Update failed", str(e))
+                    self.pending_lbl.config(text="", fg=PENDING_FG)
+            self._schedule_callback(_apply)
+
+        def on_error(msg):
+            self._schedule_callback(
+                lambda: messagebox.showerror("Update failed", msg)
+            )
+            self._schedule_callback(
+                lambda: self.pending_lbl.config(text="", fg=PENDING_FG)
+            )
+
+        download_and_replace(download_url, on_progress=on_progress,
+                             on_done=on_done, on_error=on_error)
+
     def _build_status_bar(self):
         status_outer = tk.Frame(self.root, bg=BG_PANEL, bd=0)
         status_outer.pack(fill="x", side="bottom", padx=4, pady=4)
 
+        # Collapsible header
+        self._status_collapsed = False
+        header = tk.Frame(status_outer, bg=BG_PANEL, cursor="hand2")
+        header.pack(fill="x", padx=10, pady=(4, 0))
+        self._status_arrow = tk.Label(header, text="▾", font=("Consolas", 9),
+                                       bg=BG_PANEL, fg=FG_DIM, anchor="w")
+        self._status_arrow.pack(side="left")
+        self._status_summary = tk.Label(header, text="", font=("Consolas", 9),
+                                         bg=BG_PANEL, fg=FG_DIM, anchor="w")
+        self._status_summary.pack(side="left", padx=(4, 0))
+        for w in (header, self._status_arrow, self._status_summary):
+            w.bind("<Button-1>", lambda e: self._toggle_status_bar())
+
         inner = tk.Frame(status_outer, bg=BG_PANEL, padx=10, pady=8)
         inner.pack(fill="x")
+        self._status_inner = inner
 
         # Pending label
         pending_row = tk.Frame(inner, bg=BG_PANEL)
@@ -1088,6 +1155,14 @@ class App:
                                         activebackground=RED_DARK, activeforeground=FG_BRIGHT)
         menubar.add_cascade(label="Playlists", menu=self._playlists_menu)
         self._refresh_playlists_menu()
+
+        tools_menu = tk.Menu(menubar, tearoff=0, bg=BG_PANEL, fg=FG,
+                             activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+        tools_menu.add_command(label="Spotify Download...",
+                              command=self._open_spotify_window,
+                              accelerator="Ctrl+Shift+S")
+        self.root.bind("<Control-Shift-S>", lambda e: self._open_spotify_window())
+        menubar.add_cascade(label="Tools", menu=tools_menu)
 
     def _set_ui_locked(self, locked: bool):
         state = "disabled" if locked else "!disabled"
@@ -1924,6 +1999,7 @@ class App:
         self._backup_before_sync()
         removes = sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True)
         adds = list(self.staging.pending_adds)
+        adds = self._reorder_adds(adds)
         journal = SyncJournal.begin(removes, adds, self.staging.pending_reorders)
         idx = 0
         for r in removes:
@@ -1952,6 +2028,27 @@ class App:
             self.mgr.save_snapshot()
         except Exception:
             pass
+
+    def _reorder_adds(self, adds: list[dict]) -> list[dict]:
+        """Reorder pending adds to match any staged reorder with p:N keys."""
+        for pid, order in self.staging.pending_reorders.items():
+            p_keys = [e["key"] for e in order if e["key"].startswith("p:")]
+            if not p_keys:
+                continue
+            pid_adds = [a for a in adds if a["pid"] == pid]
+            if not pid_adds:
+                continue
+            add_by_key = {f"p:{i}": a for i, a in enumerate(pid_adds)}
+            reordered = [add_by_key[k] for k in p_keys if k in add_by_key]
+            for a in pid_adds:
+                if a not in reordered:
+                    reordered.append(a)
+            insert_pos = adds.index(pid_adds[0])
+            for a in pid_adds:
+                adds.remove(a)
+            for i, a in enumerate(reordered):
+                adds.insert(insert_pos + i, a)
+        return adds
 
     def _apply_reorders(self):
         """Re-tag and rename committed tracks to match the staged reorder."""
@@ -2069,7 +2166,7 @@ class App:
         self.sync_file_bar["maximum"] = 100
         self.sync_file_bar["value"] = 0
 
-        adds = list(self.staging.pending_adds)
+        adds = self._reorder_adds(list(self.staging.pending_adds))
         removes = sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True)
         journal = SyncJournal.begin(removes, adds, self.staging.pending_reorders)
 
@@ -2513,6 +2610,17 @@ class App:
 
     # ── .m3u import ──
 
+    def _open_spotify_window(self):
+        if hasattr(self, "_spotify_window") and self._spotify_window:
+            try:
+                self._spotify_window.win.deiconify()
+                self._spotify_window.win.lift()
+                return
+            except tk.TclError:
+                self._spotify_window = None
+        from .spotiflac_ui import SpotiFLACWindow
+        self._spotify_window = SpotiFLACWindow(self)
+
     def _import_m3u_dialog(self):
         """Open a file picker to import .m3u/.m3u8 playlists."""
         if self._syncing:
@@ -2557,9 +2665,18 @@ class App:
             messagebox.showerror("Error", f"Could not create playlist '{name}'.")
             return
 
+        start_idx = len(self.staging.pending_adds)
         for track_path in tracks:
             title, artist = _read_tags_from_file(track_path)
             self.staging.stage_add(pid, str(track_path), title, artist)
+
+        added_indices = list(range(start_idx, len(self.staging.pending_adds)))
+        if added_indices:
+            self._undo_stack.append({
+                "type": "add",
+                "indices": added_indices,
+                "desc": f"Import {len(added_indices)} track(s) from {m3u_path.name}",
+            })
 
         self._refresh_playlists()
         self.playlist_tree.selection_set(pid)
@@ -2667,6 +2784,16 @@ class App:
         pid = self.current_pid
         name = pl["name"]
         self.current_pid = None
+
+        self.staging.pending_adds = [
+            a for a in self.staging.pending_adds if a["pid"] != pid
+        ]
+        self.staging.pending_removes = [
+            r for r in self.staging.pending_removes if r["pid"] != pid
+        ]
+        self.staging.pending_reorders.pop(pid, None)
+        self.staging.save()
+        self._undo_stack.clear()
 
         def delete():
             try:
@@ -3150,6 +3277,20 @@ class App:
         else:
             self.undo_btn.state(["disabled"])
             self.undo_lbl.config(text="")
+
+        summary = f"{s['playlists']} playlists | {virtual_count}/{MAX_TRACKS} tracks | {drive_pct}%"
+        if self.staging.has_pending:
+            summary += f" | {self.staging.total_ops} pending"
+        self._status_summary.config(text=summary)
+
+    def _toggle_status_bar(self):
+        self._status_collapsed = not self._status_collapsed
+        if self._status_collapsed:
+            self._status_inner.pack_forget()
+            self._status_arrow.config(text="▸")
+        else:
+            self._status_inner.pack(fill="x")
+            self._status_arrow.config(text="▾")
 
     def _color_bar(self, bar, pct):
         if pct >= 90:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .naming import fuzzy_resolve
+
 
 def parse_m3u(m3u_path: Path, source_root: Path | None = None) -> dict:
     """Parse an .m3u or .m3u8 file.
@@ -58,6 +60,12 @@ def _resolve_entry(entry: str, m3u_dir: Path, source_root: Path | None) -> Path 
         from_source = source_root / entry
         if from_source.exists():
             return from_source.resolve()
+
+    # Fuzzy match: normalize smart quotes, curly apostrophes, dashes, etc.
+    for candidate in [m3u_dir / entry] + ([source_root / entry] if source_root else []):
+        hit = fuzzy_resolve(candidate)
+        if hit and hit.is_file():
+            return hit.resolve()
 
     return None
 

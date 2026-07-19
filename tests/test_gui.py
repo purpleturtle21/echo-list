@@ -564,6 +564,34 @@ class TestAppReorder:
         for t in tracks:
             assert (app.mgr.writer.root / folder / t["copy_name"]).exists()
 
+    def test_reorder_pending_adds_before_initial_sync(self, app, gui_env):
+        """Reordering tracks in a new playlist before the first sync should
+        produce files in the reordered sequence."""
+        app._create_playlist()
+        src1 = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        src2 = gui_env["src"] / "ArtistB" / "Album2" / "03 Song Two.flac"
+        src3 = gui_env["src"] / "ArtistC" / "Album3" / "05 Song Three.flac"
+        app._stage_add_files([src1, src2, src3])
+
+        # Reverse: p:2, p:1, p:0
+        app.staging.set_reorder(
+            app.current_pid,
+            [{"key": "p:2"}, {"key": "p:1"}, {"key": "p:0"}],
+        )
+        app._do_sync_blocking()
+
+        tracks = app.mgr.store.playlists[app.current_pid]["tracks"]
+        assert len(tracks) == 3
+        assert "Song Three" in tracks[0]["copy_name"]
+        assert "Song Two" in tracks[1]["copy_name"]
+        assert "Song One" in tracks[2]["copy_name"]
+        assert tracks[0]["copy_name"].startswith("01 - ")
+        assert tracks[1]["copy_name"].startswith("02 - ")
+        assert tracks[2]["copy_name"].startswith("03 - ")
+        folder = app.mgr.store.playlists[app.current_pid]["folder"]
+        for t in tracks:
+            assert (app.mgr.writer.root / folder / t["copy_name"]).exists()
+
 
 class TestM3uImport:
     def test_import_m3u_creates_playlist_and_stages(self, app, gui_env):
@@ -616,6 +644,24 @@ class TestM3uImport:
             app._import_m3u_file(m3u)
 
         assert "new_playlist_(2)" in app.mgr.store.playlists
+
+    def test_import_m3u_undo_unstages_all(self, app, gui_env):
+        """Undoing an m3u import should remove all staged tracks from it."""
+        m3u = gui_env["tmp"] / "Undo Test.m3u"
+        m3u.write_text(
+            "ArtistA/Album1/01 Song One.flac\n"
+            "ArtistB/Album2/03 Song Two.flac\n",
+            encoding="utf-8",
+        )
+        with patch("echolist.gui.messagebox.showinfo"):
+            app._import_m3u_file(m3u)
+
+        assert len(app.staging.pending_adds) == 2
+        assert len(app._undo_stack) == 1
+        assert app._undo_stack[-1]["type"] == "add"
+
+        app._do_undo()
+        assert len(app.staging.pending_adds) == 0
 
     def test_import_m3u_sync_copies_files(self, app, gui_env):
         """After importing and syncing, tracks are copied to device."""
@@ -1129,6 +1175,23 @@ class TestDeletePlaylist:
             app._delete_playlist()
         call_text = mock.call_args[1].get("message", mock.call_args[0][1])
         assert "cannot be restored" not in call_text.lower()
+
+    def test_delete_playlist_clears_staged_adds(self, app, gui_env):
+        """Deleting a playlist with pending staged adds should not error."""
+        app._create_playlist()
+        pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        assert len(app.staging.pending_adds) == 1
+
+        with patch("echolist.gui.messagebox.askyesno", return_value=True):
+            app._delete_playlist()
+        _flush_bg_ops(app)
+
+        assert pid not in app.mgr.store.playlists
+        assert not any(a["pid"] == pid for a in app.staging.pending_adds)
+        assert not any(r["pid"] == pid for r in app.staging.pending_removes)
+        assert pid not in app.staging.pending_reorders
 
 
 class TestOffloadOnload:
