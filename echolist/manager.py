@@ -168,8 +168,7 @@ class PlaylistManager:
 
         disk_files = sorted(
             f for f in folder_path.iterdir()
-            if f.is_file() and f.suffix.lower() in AUDIO_EXTS
-            and not f.name.startswith("_echolist_tmp_")
+            if _is_real_audio(f) and not f.name.startswith("_echolist_tmp_")
         )
 
         by_name = {t["copy_name"]: t for t in playlist["tracks"]}
@@ -347,6 +346,8 @@ class PlaylistManager:
 
         for t in playlist["tracks"]:
             copy_name = t["copy_name"]
+            if copy_name.startswith("._"):
+                continue
             track_path = folder_path / copy_name
             if not track_path.exists():
                 continue
@@ -679,7 +680,7 @@ class PlaylistManager:
                 continue
             audio_files = [
                 f for f in d.iterdir()
-                if f.is_file() and f.suffix.lower() in AUDIO_EXTS
+                if _is_real_audio(f)
             ]
             if audio_files:
                 untracked.append({
@@ -705,7 +706,7 @@ class PlaylistManager:
 
         audio_files = sorted(
             f for f in folder_path.iterdir()
-            if f.is_file() and f.suffix.lower() in AUDIO_EXTS
+            if _is_real_audio(f)
         )
         if not audio_files:
             raise ValueError(f"no audio files in {folder_name}")
@@ -777,13 +778,23 @@ class PlaylistManager:
 AUDIO_EXTS = frozenset({".flac", ".mp3", ".m4a", ".wav", ".ogg", ".aac", ".wma", ".alac", ".aiff", ".dsf", ".dff"})
 
 
+def _is_real_audio(p: Path) -> bool:
+    """True if p is a real audio file, excluding macOS AppleDouble /
+    dot-underscore artifacts (._Foo.m4a) which only have an audio-like suffix."""
+    return (
+        p.is_file()
+        and p.suffix.lower() in AUDIO_EXTS
+        and not p.name.startswith("._")
+    )
+
+
 def _count_audio_files(root: Path, exclude: Path | None = None) -> int:
     count = 0
     try:
         for f in root.rglob("*"):
             if exclude and f.is_relative_to(exclude):
                 continue
-            if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
+            if _is_real_audio(f):
                 count += 1
     except OSError:
         pass
