@@ -1141,6 +1141,8 @@ class App:
 
     def _show_settings(self):
         """Unified settings screen — used both for initial setup and in-app config."""
+        if self.mgr is not None and self._busy():
+            return
         for w in self.root.winfo_children():
             w.destroy()
         self.root.config(menu=tk.Menu(self.root))
@@ -1278,20 +1280,27 @@ class App:
             interval = 5
 
         if self.mgr:
-            self.mgr.config.backup_interval = interval
-            self.mgr.config.save(self.mgr.writer)
-
-            if (source != self.source or dest != self.dest
-                    or folder != self.mgr.config.playlist_folder):
-                # A different folder is a different workspace: reopen there
-                # instead of rewriting this workspace's config.
-                self.mgr.release_lock()
+            if self._busy():
+                return
+            new_root = (Path(dest) / folder).resolve()
+            if new_root == Path(self.mgr.writer.root).resolve():
+                # Same workspace: only its settings change.
+                self.mgr.config.backup_interval = interval
+                self.mgr.config.source_root = str(Path(source).resolve())
+                try:
+                    self.mgr.config.save(self.mgr.writer)
+                except OSError as e:
+                    messagebox.showerror("Could not save settings", str(e))
+                    return
+                self.source = source
+                save_defaults(source, dest, folder)
+                self._show_main()
+            else:
+                # A different workspace: open it first and keep this one's
+                # lock (and config) untouched until that has succeeded.
                 self._open_workspace(source, dest,
                                      playlist_folder=folder,
                                      backup_interval=interval)
-            else:
-                save_defaults(source, dest, folder)
-                self._show_main()
         else:
             self._open_workspace(source, dest,
                                  playlist_folder=folder,
@@ -1329,11 +1338,7 @@ class App:
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
-        self.mgr = mgr
-        self.source = source
-        self.dest = dest
-        self.root.unbind("<Return>")
-        self._bind_workspace_state(mgr)
+        self._adopt_manager(mgr, source, dest)
 
         if is_external and is_empty:
             has_audio = any(
@@ -1354,6 +1359,19 @@ class App:
 
         self._show_main()
 
+    def _adopt_manager(self, mgr, source: str, dest: str) -> None:
+        """Switch to an opened (and locked) workspace, then release the old
+        one. The old lock is held until the new workspace is open, so a failed
+        switch leaves the app on the workspace it still owns."""
+        old = self.mgr
+        self.mgr = mgr
+        self.source = source
+        self.dest = dest
+        if old is not None and old is not mgr:
+            old.release_lock()
+        self.root.unbind("<Return>")
+        self._bind_workspace_state(mgr)
+
     def _bind_workspace_state(self, mgr):
         """Load this workspace's staged changes and recover from a crash.
 
@@ -1362,7 +1380,13 @@ class App:
         """
         self._undo_stack.clear()
         path = pending_file(mgr.writer.root)
-        _bind_legacy_staging(path, mgr.store)
+        try:
+            _bind_legacy_staging(path, mgr.store)
+        except StagingLoadError as e:
+            messagebox.showwarning(
+                "Old staged changes unreadable",
+                f"{e}\n\nThe file was left where it is and not applied to "
+                f"this workspace.")
         try:
             self.staging = StagingState(path)
         except StagingLoadError as e:
@@ -1441,11 +1465,7 @@ class App:
             messagebox.showerror("Error", str(e))
             return False
 
-        self.mgr = mgr
-        self.source = snap_source
-        self.dest = dest
-        self.root.unbind("<Return>")
-        self._bind_workspace_state(mgr)
+        self._adopt_manager(mgr, snap_source, dest)
 
         missing_sources = []
         source_root = Path(snap_source)
@@ -1801,6 +1821,8 @@ class App:
                 self._playlists_menu.add_cascade(label=f"{name} (deleted)", menu=sub)
 
     def _permanently_delete_playlist(self, pid: str, name: str):
+        if self._busy():
+            return
         confirm = messagebox.askyesno(
             "Permanently delete",
             f"Permanently delete all restore points for '{name}'?\n\n"
@@ -1814,6 +1836,8 @@ class App:
         self._refresh_playlists_menu()
 
     def _create_restore_point(self, pid: str):
+        if self._busy():
+            return
         playlist = self.mgr.store.playlists.get(pid)
         if not playlist:
             return
@@ -1833,6 +1857,8 @@ class App:
             )
 
     def _restore_from_point(self, pid: str, timestamp: str):
+        if self._busy():
+            return
         playlist = self.mgr.store.playlists.get(pid)
         if not playlist:
             return
@@ -1887,6 +1913,8 @@ class App:
         self._run_playlist_op(pid, name, restore, on_done)
 
     def _restore_deleted(self, pid: str, timestamp: str):
+        if self._busy():
+            return
         label = _format_backup_timestamp(timestamp)
         from .config import load_backup
         data = load_backup(self.mgr.writer.root, pid, timestamp)
@@ -2196,6 +2224,8 @@ class App:
     # ── Playlist context menu (offload/onload) ──
 
     def _playlist_context_menu(self, event):
+        if self._busy():
+            return
         iid = self.playlist_tree.identify_row(event.y)
         if not iid or iid.startswith("_imported:"):
             return
@@ -2229,6 +2259,8 @@ class App:
         self._show_popup_menu(menu, event)
 
     def _reindex_playlist(self, pid: str):
+        if self._busy():
+            return
         pl = self.mgr.store.playlists.get(pid)
         if not pl or not pl.get("tracks"):
             return
@@ -2240,6 +2272,8 @@ class App:
         self._update_status()
 
     def _offload_playlist(self, pid: str):
+        if self._busy():
+            return
         pl = self.mgr.store.playlists.get(pid)
         if not pl:
             return
@@ -2263,17 +2297,28 @@ class App:
             return
 
         def offload():
-            self.mgr.backup_playlist_metadata(pid)
-            folder = pl["folder"]
-            try:
-                self.mgr.writer.delete(folder)
-            except Exception:
-                pass
+            # A missing restore point would make the offload unrecoverable,
+            # so a backup failure aborts before anything is deleted.
+            backup = self.mgr.backup_playlist_metadata(pid)
+            self.mgr.writer.delete(pl["folder"])
+            return backup
+
+        def on_done(backup):
+            saved = {k: pl[k] for k in ("tracks", "offloaded", "offload_backup")
+                     if k in pl}
             pl["tracks"] = []
             pl["offloaded"] = True
-            self.mgr.store.save()
-
-        def on_done(_):
+            if backup is not None:
+                pl["offload_backup"] = Path(backup).stem
+            try:
+                self.mgr.store.save()
+            except OSError as e:
+                pl.pop("offload_backup", None)
+                pl.update(saved)
+                messagebox.showerror(
+                    "Offload incomplete",
+                    f"The tracks were removed from the device, but the "
+                    f"playlist list could not be saved:\n{e}")
             self._invalidate_caches(pid)
             self._refresh_playlists()
             self._refresh_tracks()
@@ -2281,20 +2326,33 @@ class App:
 
         self._run_playlist_op(pid, name, offload, on_done)
 
+    def _offload_backup_timestamp(self, pid: str) -> str | None:
+        """The restore point taken when ``pid`` was offloaded. Offloading
+        records it (backup_playlist_metadata can dedupe to an *older* point);
+        older stores without the record fall back to the newest backup."""
+        from .config import list_backups
+        backups = list_backups(self.mgr.writer.root, pid)
+        recorded = self.mgr.store.playlists.get(pid, {}).get("offload_backup")
+        if recorded and any(b["timestamp"] == recorded for b in backups):
+            return recorded
+        return backups[0]["timestamp"] if backups else None
+
     def _onload_playlist(self, pid: str):
+        if self._busy():
+            return
         pl = self.mgr.store.playlists.get(pid)
         if not pl:
             return
-        from .config import load_backup, list_backups
-        backups = list_backups(self.mgr.writer.root, pid)
-        if not backups:
+        from .config import load_backup
+        timestamp = self._offload_backup_timestamp(pid)
+        if timestamp is None:
             messagebox.showerror("No backup", "No restore point found for this playlist.")
             return
 
         name = pl["name"]
 
         def onload():
-            data = load_backup(self.mgr.writer.root, pid, backups[0]["timestamp"])
+            data = load_backup(self.mgr.writer.root, pid, timestamp)
             if not data:
                 raise ValueError("Could not load backup data")
             return data.get("tracks", [])
@@ -2307,9 +2365,18 @@ class App:
                 messagebox.showerror("Onload failed",
                                      f"Could not create the playlist folder:\n{e}")
                 return
+            saved = {k: pl[k] for k in ("tracks", "offloaded", "offload_backup")
+                     if k in pl}
             pl["offloaded"] = False
             pl["tracks"] = []
-            self.mgr.store.save()
+            pl.pop("offload_backup", None)
+            try:
+                self.mgr.store.save()
+            except OSError as e:
+                pl.update(saved)
+                messagebox.showerror("Onload failed",
+                                     f"Could not save the playlist list:\n{e}")
+                return
 
             # Stage all tracks for re-copying from source
             source_root = Path(self.mgr.config.source_root).resolve()
@@ -2414,6 +2481,8 @@ class App:
             pass
 
     def _add_selected_from_source(self, selected=None):
+        if self._busy():
+            return
         if selected is None:
             selected = self.source_tree.selection()
         if not selected:
@@ -2448,7 +2517,7 @@ class App:
     # ── Staging operations ──
 
     def _stage_add_files(self, paths: list[Path]):
-        if self._syncing or self._current_playlist_offloaded():
+        if self._busy() or self._current_playlist_offloaded():
             return
         if not self.current_pid:
             messagebox.showinfo("No playlist", "Select or create a playlist first.")
@@ -2492,6 +2561,8 @@ class App:
         self._update_status()
 
     def _stage_remove_track(self, pid: str, index: int, copy_name: str):
+        if self._busy():
+            return
         before = self.staging.snapshot()
         self.staging.stage_remove(pid, index, copy_name)
         self._push_undo(f"Remove #{index} from {pid}", before)
@@ -2507,7 +2578,7 @@ class App:
         })
 
     def _do_undo(self):
-        if not self._undo_stack or self._syncing:
+        if not self._undo_stack or self._busy():
             return
         action = self._undo_stack.pop()
         self.staging.restore(action["staging"])
@@ -2516,10 +2587,13 @@ class App:
         self._update_status()
 
     def _on_close(self):
-        if self._syncing:
+        if self._busy():
+            # Keep the workspace lock until the worker writing the card ends;
+            # the sync / playlist-op finish handler shuts down once idle.
             self._exit_after_sync = True
-            messagebox.showinfo("Sync in progress",
-                                "EchoList will close when the sync finishes.")
+            messagebox.showinfo("Operation in progress",
+                                "EchoList will close when the current "
+                                "operation finishes.")
             return
         if self.staging and self.staging.has_pending:
             n = self.staging.total_ops
@@ -2551,8 +2625,8 @@ class App:
         self.root.destroy()
 
     def _on_interrupt(self):
-        """Ctrl+C in the terminal: exit cleanly, after a running sync."""
-        if self._syncing:
+        """Ctrl+C in the terminal: exit cleanly, after running operations."""
+        if self._busy():
             self._exit_after_sync = True
             return
         self._shutdown()
@@ -2578,10 +2652,7 @@ class App:
             affected.add(pid)
         for pid in affected:
             if pid in self.mgr.store.playlists:
-                try:
-                    self.mgr.backup_playlist_metadata(pid)
-                except Exception:
-                    pass
+                self.mgr.backup_playlist_metadata(pid)
         self.mgr.config.increment_sync(self.mgr.writer)
 
     def _journal_path(self) -> Path:
@@ -2600,7 +2671,11 @@ class App:
 
     def _do_sync_blocking(self) -> list[str]:
         """Synchronous sync for use during close. Returns the errors."""
-        self._backup_before_sync()
+        try:
+            self._backup_before_sync()
+        except OSError as e:
+            return [f"Sync not started: could not save the restore point "
+                    f"or sync counter: {e}"]
         errors, _ = run_sync(self.mgr, self.staging, self._journal_path())
         self._after_sync()
         return errors
@@ -2608,12 +2683,20 @@ class App:
     # ── SYNC ──
 
     def _do_sync(self):
-        if not self.staging.has_pending or self._syncing:
+        if not self.staging.has_pending or self._busy():
+            return
+        try:
+            self._backup_before_sync()
+        except OSError as e:
+            messagebox.showerror(
+                "Sync not started",
+                f"Could not save the restore point or sync counter:\n{e}\n\n"
+                f"Nothing was changed on the device; your changes are still "
+                f"staged.")
             return
 
         self._syncing = True
         self._set_ui_locked(True)
-        self._backup_before_sync()
         total = self.staging.total_ops
 
         # Swap button for progress bars
@@ -2668,7 +2751,7 @@ class App:
             else:
                 self.pending_lbl.config(text="  ✓ Sync complete", fg=GREEN)
                 self.root.after(4000, lambda: self.pending_lbl.config(text="", fg=PENDING_FG))
-            if self._exit_after_sync:
+            if self._exit_after_sync and not self._busy():
                 self._shutdown()
 
         self._spawn(worker)
@@ -2677,7 +2760,7 @@ class App:
 
     def _refresh_all(self):
         """Reload source tree, playlists, tracks, and stats."""
-        if self._syncing:
+        if self._busy():
             return
         source_root = Path(self.mgr.config.source_root).resolve()
         if source_root.exists():
@@ -2736,8 +2819,14 @@ class App:
             self._refresh_playlists_menu()
 
     def _run_playlist_op(self, pid: str, display_name: str, operation, on_done=None):
-        """Run a blocking playlist operation in a background thread with spinner."""
+        """Run a blocking playlist operation in a background thread with spinner.
+
+        ``operation`` runs on the worker and should only do file I/O; changes
+        to the Store (and store.save()) belong in ``on_done``, which runs on
+        the Tk thread. Every other writer is refused (``_busy()``) meanwhile.
+        """
         self._busy_playlists.add(pid)
+        self._set_ui_locked(True)
         try:
             self.playlist_tree.item(pid, values=("⟳", f"{display_name} {self._spinner_frames[0]}"),
                                     tags=("busy",))
@@ -2771,10 +2860,16 @@ class App:
                     self.playlist_tree.item(pid, values=(icon, name), tags=tags)
             except Exception:
                 pass
-            if error:
-                messagebox.showerror("Error", str(error))
-            elif on_done:
-                on_done(result)
+            try:
+                if error:
+                    messagebox.showerror("Error", str(error))
+                elif on_done:
+                    on_done(result)
+            finally:
+                if not self._busy():
+                    self._set_ui_locked(False)
+                    if self._exit_after_sync:
+                        self._shutdown()
 
         self._spawn(worker)
 
@@ -2908,6 +3003,8 @@ class App:
         self.fix_meta_btn.unbind("<Leave>")
 
     def _fix_metadata_clicked(self):
+        if self._busy():
+            return
         if not self.current_pid:
             return
         issues = self.mgr.audit_playlist_metadata(self.current_pid)
@@ -2959,6 +3056,8 @@ class App:
             self._run_playlist_op(pid, pl["name"], fix, on_done)
 
     def _offer_adopt_playlist(self, info: dict):
+        if self._busy():
+            return
         folder = info["folder"]
         count = info["track_count"]
         folder_path = self.mgr.writer.root / folder
@@ -3002,7 +3101,7 @@ class App:
         self._run_playlist_op(pid, folder, adopt, on_done)
 
     def _create_playlist(self):
-        if self._syncing:
+        if self._busy():
             return
         temp_name = "New Playlist"
         try:
@@ -3032,7 +3131,7 @@ class App:
 
     def _import_m3u_dialog(self):
         """Open a file picker to import .m3u/.m3u8 playlists."""
-        if self._syncing:
+        if self._busy():
             return
         files = filedialog.askopenfilenames(
             title="Import .m3u playlists",
@@ -3046,6 +3145,8 @@ class App:
 
     def _import_m3u_file(self, m3u_path: Path):
         """Parse one .m3u file, create a playlist, and stage found tracks."""
+        if self._busy():
+            return
         source_root = Path(self.mgr.config.source_root).resolve()
         result = parse_m3u(m3u_path, source_root=source_root)
 
@@ -3095,6 +3196,8 @@ class App:
         messagebox.showinfo("Playlist imported", "\n".join(parts))
 
     def _start_inline_rename(self, pid):
+        if self._busy():
+            return
         if pid not in self.mgr.store.playlists:
             return
         self.playlist_tree.update_idletasks()
@@ -3135,7 +3238,7 @@ class App:
 
     def _rename_playlist(self, pid: str, new_name: str) -> bool:
         """Rename a playlist: folder on the device, store, backups, staging."""
-        if self._syncing or pid in self._busy_playlists:
+        if self._busy():
             return False
         new_pid = playlist_id(new_name)
         if new_pid != pid and new_pid in self.mgr.store.playlists:
@@ -3195,7 +3298,7 @@ class App:
         return True
 
     def _delete_playlist(self):
-        if self._syncing:
+        if self._busy():
             return
         if not self.current_pid:
             return
@@ -3219,18 +3322,25 @@ class App:
         self.current_pid = None
 
         def delete():
-            try:
-                self.mgr.backup_playlist_metadata(pid)
-            except Exception:
-                pass
-            try:
-                self.mgr.writer.delete(pl["folder"])
-            except Exception:
-                pass
-            del self.mgr.store.playlists[pid]
-            self.mgr.store.save()
+            # The restore point is what makes this undoable: if it cannot be
+            # written, nothing is deleted. A folder that is already gone is
+            # fine (writer.delete ignores it); any other error aborts.
+            self.mgr.backup_playlist_metadata(pid)
+            self.mgr.writer.delete(pl["folder"])
 
         def on_done(_result):
+            del self.mgr.store.playlists[pid]
+            try:
+                self.mgr.store.save()
+            except OSError as e:
+                self.mgr.store.playlists[pid] = pl
+                messagebox.showerror(
+                    "Delete incomplete",
+                    f"The playlist folder was removed from the device, but the "
+                    f"playlist list could not be saved:\n{e}")
+                self._refresh_playlists()
+                self._update_status()
+                return
             self.staging.drop_pid(pid)
             self._undo_stack.clear()
             self._refresh_playlists()
@@ -3261,13 +3371,13 @@ class App:
         self.track_tree.delete(*self.track_tree.get_children())
         self._track_data = []
         self._removed_data = []
-        from .config import list_backups, load_backup
-        backups = list_backups(self.mgr.writer.root, pid)
-        if not backups:
+        from .config import load_backup
+        timestamp = self._offload_backup_timestamp(pid)
+        if timestamp is None:
             self.track_tree.insert("", "end", values=("", "(offloaded — no backup found)", ""),
                                    tags=("offloaded_track",))
             return
-        data = load_backup(self.mgr.writer.root, pid, backups[0]["timestamp"])
+        data = load_backup(self.mgr.writer.root, pid, timestamp)
         if not data:
             return
         for entry in data.get("tracks", []):
@@ -3288,7 +3398,7 @@ class App:
         # Rescan here, on the main thread: it rewrites the store, which must
         # not happen from the tag-loading thread (or during a sync / a
         # background playlist operation, which own the store meanwhile).
-        if not self._syncing and pid not in getattr(self, "_busy_playlists", ()):
+        if not self._busy():
             self.mgr.rescan_playlist(pid)
         playlist = self.mgr.store.playlists[pid]
         folder = playlist["folder"]
@@ -3431,7 +3541,7 @@ class App:
     # ── Track reorder drag ──
 
     def _trk_drag_start(self, event):
-        if self._current_playlist_offloaded():
+        if self._busy() or self._current_playlist_offloaded():
             self._trk_drag_iid = None
             return
         iid = self.track_tree.identify_row(event.y)
@@ -3466,6 +3576,9 @@ class App:
         if not self._trk_drag_iid:
             return
         self._trk_drag_iid = None
+        if self._busy():
+            self._display_tracks()  # undo the drag's visual moves
+            return
 
         # Read new order from tree, rebuild _track_data and save reorder
         all_iids = self.track_tree.get_children()
@@ -3542,7 +3655,7 @@ class App:
         return copy_name or "", ""
 
     def _remove_track(self, event=None):
-        if self._syncing or self._current_playlist_offloaded():
+        if self._busy() or self._current_playlist_offloaded():
             return
         if not self.current_pid:
             return
