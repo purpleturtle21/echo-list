@@ -39,7 +39,7 @@ def large_source(tmp_path):
 
 
 def test_large_playlist_three_digit_padding(large_source, tmp_path):
-    """Playlists with >99 tracks use 3-digit zero-padded filenames."""
+    """Playlists with >99 tracks use 3-digit zero-padded filenames throughout."""
     dest = tmp_path / "card"
     dest.mkdir()
     mgr = PlaylistManager.init(large_source, dest)
@@ -50,9 +50,9 @@ def test_large_playlist_three_digit_padding(large_source, tmp_path):
 
     tracks = mgr.store.playlists[pid]["tracks"]
     assert len(tracks) == 105
-    # First 99 tracks are added with 2-digit padding; track 100+ get 3-digit
-    assert tracks[0]["copy_name"].startswith("01 - ")
-    assert tracks[98]["copy_name"].startswith("99 - ")
+    # Crossing 100 re-pads the earlier tracks so names sort in playlist order
+    assert tracks[0]["copy_name"].startswith("001 - ")
+    assert tracks[98]["copy_name"].startswith("099 - ")
     assert tracks[99]["copy_name"].startswith("100 - ")
     assert tracks[104]["copy_name"].startswith("105 - ")
 
@@ -405,19 +405,37 @@ def test_rescan_file_without_index_separator(manager, source):
 
 # ── Renumber robustness ──
 
-def test_renumber_preserves_store_on_rename_failure(manager, source):
-    """If a file rename fails during renumber, the store still saves."""
+def test_renumber_preserves_store_on_rename_failure(manager, source, monkeypatch):
+    """A rename that fails part-way through a renumber leaves a Store whose
+    every name is a file on the card holding that entry's audio."""
     pid = manager.create_playlist("Mix")
-    manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
-    manager.add_track(pid, source / "ArtistB" / "Album2" / "03 Song Two.flac")
+    for p in ("ArtistA/Album1/01 Song One.flac", "ArtistB/Album2/03 Song Two.flac",
+              "ArtistC/Album3/05 Song Three.flac"):
+        manager.add_track(pid, source / p)
 
-    tracks_before = [t["copy_name"] for t in manager.store.playlists[pid]["tracks"]]
+    real_rename = SafeWriter.rename
+    calls = []
 
-    manager.remove_track(pid, 1)
+    def flaky_rename(self, old, new):
+        calls.append((old, new))
+        if len(calls) == 3:  # both tracks parked; the first publish fails
+            raise OSError(errno.EIO, "card I/O error")
+        return real_rename(self, old, new)
 
-    tracks_after = manager.store.playlists[pid]["tracks"]
-    assert len(tracks_after) == 1
-    assert tracks_after[0]["index"] == 1
+    monkeypatch.setattr(SafeWriter, "rename", flaky_rename)
+    with pytest.raises(OSError):
+        manager.remove_track(pid, 1)
+    assert len(calls) == 3
+
+    stored = json.loads((manager.writer.root / ".echolist" / "playlists.json")
+                        .read_text(encoding="utf-8"))["playlists"][pid]["tracks"]
+    folder = manager.writer.root / "Mix"
+    assert len(stored) == 2
+    for t in stored:
+        assert (folder / t["copy_name"]).exists(), t["copy_name"]
+        assert FLAC(folder / t["copy_name"])["ECHOLIST_SRC"][0] == t["src_path"]
+    on_disk = {f.name for f in folder.iterdir() if f.suffix == ".flac"}
+    assert on_disk == {t["copy_name"] for t in stored}
 
 
 # ── Source file disappears before add ──

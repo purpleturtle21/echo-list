@@ -94,7 +94,7 @@ def curate_playlist_name(raw_name: str, existing_names: set[str]) -> str:
     """
     from .naming import sanitize, playlist_id
 
-    # A leading dot would make a hidden folder on the player and on macOS.
+    # Playlist folders can't start with a dot (see check_playlist_folder_name).
     name = sanitize(sanitize(raw_name).lstrip(". "))
     if playlist_id(name) not in existing_names:
         return name
