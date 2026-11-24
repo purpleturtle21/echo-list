@@ -5,6 +5,7 @@ import copy
 import errno
 import json
 import re
+import sys
 import threading
 import tkinter as tk
 import unicodedata
@@ -863,6 +864,17 @@ class App:
         self._set_icon()
         self._center_window(420, 700)
         self.root.minsize(380, 550)
+        self._init_state()
+        self._poll_callbacks()
+        self._apply_theme()
+        self._show_setup()
+
+    def _init_state(self):
+        """Every attribute the App relies on, before any screen is built.
+
+        Kept separate from __init__ so tests can build an App on a withdrawn
+        root without the setup screen and still get exactly this state.
+        """
         self.mgr = None
         self.source = None
         self.dest = None
@@ -870,6 +882,8 @@ class App:
         # Bound to a workspace's pending.json in _open_workspace.
         self.staging = StagingState(load=False)
         self._undo_stack: list[dict] = []
+        # Close was requested while a sync or playlist operation ran: shut
+        # down (releasing the workspace lock) once the last one finishes.
         self._exit_after_sync = False
         self._sort_col = None
         self._sort_reverse = False
@@ -879,14 +893,31 @@ class App:
         self._stats_pending = False
         self._alive = True
         self._syncing = False
+        self._busy_playlists: set[str] = set()
         self._tag_cache: dict[str, tuple[str, str]] = {}
         self._audit_cache: dict[str, list[dict]] = {}
         self._tracks_loading = False
         self._tracks_gen = 0
+        self._track_data: list[dict] = []
+        self._removed_data: list[dict] = []
         self._callback_queue: Queue = Queue()
-        self._poll_callbacks()
-        self._apply_theme()
-        self._show_setup()
+        self._workers: list[Thread] = []
+
+    def _busy(self) -> bool:
+        """A sync or a background playlist operation owns the store/card.
+
+        Every action that changes the store, staging, the card or the
+        workspace checks this first, so only one writer runs at a time.
+        """
+        return self._syncing or bool(self._busy_playlists)
+
+    def _spawn(self, target, *args) -> Thread:
+        """Start a daemon worker thread and remember it (see _workers)."""
+        self._workers = [t for t in self._workers if t.is_alive()]
+        t = Thread(target=target, args=args, daemon=True)
+        self._workers.append(t)
+        t.start()
+        return t
 
     def _invalidate_caches(self, pid: str | None = None):
         """Clear tag and audit caches. If pid given, only that playlist."""
@@ -904,13 +935,28 @@ class App:
     def _poll_callbacks(self):
         """Drain the callback queue on the main thread (tkinter is not thread-safe on Windows)."""
         try:
-            while True:
+            self._drain_callbacks()
+        finally:
+            if self._alive:
+                self.root.after(16, self._poll_callbacks)
+
+    def _drain_callbacks(self) -> int:
+        """Run every queued callback; returns how many ran.
+
+        A callback that raises goes to Tk's report_callback_exception, like
+        an exception in any other Tk callback, and the rest still run.
+        """
+        ran = 0
+        while True:
+            try:
                 fn = self._callback_queue.get_nowait()
+            except Empty:
+                return ran
+            ran += 1
+            try:
                 fn()
-        except Empty:
-            pass
-        if self._alive:
-            self.root.after(16, self._poll_callbacks)
+            except Exception:
+                self.root.report_callback_exception(*sys.exc_info())
 
     def _schedule_callback(self, fn):
         """Thread-safe way to schedule a function on the main thread."""
@@ -1538,7 +1584,6 @@ class App:
         _bind_context_menu(self.playlist_tree, self._playlist_context_menu)
 
         self._rename_entry = None
-        self._busy_playlists: set[str] = set()
         self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self._spinner_idx = 0
         self._spinner_after_id = None
@@ -2626,7 +2671,7 @@ class App:
             if self._exit_after_sync:
                 self._shutdown()
 
-        Thread(target=worker, daemon=True).start()
+        self._spawn(worker)
 
     # ── Playlists ──
 
@@ -2731,7 +2776,7 @@ class App:
             elif on_done:
                 on_done(result)
 
-        Thread(target=worker, daemon=True).start()
+        self._spawn(worker)
 
     def _start_spinner(self):
         if self._spinner_after_id is not None:
@@ -2809,7 +2854,7 @@ class App:
                 return
             self._schedule_callback(lambda: self._apply_audit_result(pid, issues))
 
-        Thread(target=_audit, daemon=True).start()
+        self._spawn(_audit)
 
     def _apply_audit_result(self, pid: str, issues: list[dict]):
         if self.current_pid != pid:
@@ -3265,7 +3310,7 @@ class App:
             self._tracks_loading = True
             self.track_tree.insert("", "end", iid="_loading",
                                    values=("", "Loading...", ""), tags=("loading",))
-            Thread(target=self._load_tracks_bg, args=(pid, gen), daemon=True).start()
+            self._spawn(self._load_tracks_bg, pid, gen)
 
     def _build_track_data(self, pid: str):
         """Build track/removed data lists. Called from any thread; read-only
@@ -3320,9 +3365,9 @@ class App:
     def _load_tracks_bg(self, pid: str, gen: int):
         try:
             track_data, removed_data = self._build_track_data(pid)
-        except Exception:
+        except BaseException:
             self._tracks_loading = False
-            return
+            raise
         if not self._alive or self._tracks_gen != gen:
             self._tracks_loading = False
             return
@@ -3604,9 +3649,7 @@ class App:
             if self._alive:
                 self._schedule_callback(lambda: self._on_expensive_stats(dt, wb))
 
-        t = Thread(target=worker, daemon=True)
-        t.start()
-        self._stats_thread = t
+        self._stats_thread = self._spawn(worker)
 
     def _on_expensive_stats(self, device_tracks, workspace_bytes):
         self._cached_device_tracks = device_tracks
