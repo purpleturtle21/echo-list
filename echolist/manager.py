@@ -28,6 +28,9 @@ except ImportError:
     mutagen = None
 
 
+LOCK_REL = ".echolist/workspace.lock"
+
+
 class WorkspaceLockError(Exception):
     ...
 
@@ -82,10 +85,8 @@ class PlaylistManager:
         return mgr
 
     def _acquire_lock(self) -> None:
-        lock_path = self.writer.root / ".echolist" / "workspace.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+            fd = self.writer.open_lock(LOCK_REL)
             if os.name == "nt":
                 import msvcrt
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -210,7 +211,7 @@ class PlaylistManager:
 
     def _ensure_workspace(self) -> None:
         if not self.writer.root.exists():
-            self.writer.root.mkdir(parents=True, exist_ok=True)
+            self.writer.makedirs(".")
             self.config.save(self.writer)
 
     def add_track(self, pid: str, src: str | Path, progress_cb=None) -> str:
@@ -243,14 +244,9 @@ class PlaylistManager:
         _, src_hash = self.writer.copy_in(src, rel, progress_cb=progress_cb, compute_hash=True)
 
         album = self.config.album_prefix + playlist["name"]
-        apply_playlist_tags(
-            self.writer.resolve(rel),
-            self.config.node_name,
-            album,
-            index,
-            src_rel,
-            pid,
-        )
+        self.writer.edit_in_place(rel, lambda p: apply_playlist_tags(
+            p, self.config.node_name, album, index, src_rel, pid,
+        ))
 
         self.store.add_track(pid, {
             "index": index,
@@ -452,7 +448,8 @@ class PlaylistManager:
         album = self.config.album_prefix + playlist["name"]
         def _apply(job):
             path, index, src_rel = job
-            apply_playlist_tags(path, self.config.node_name, album, index, src_rel, pid)
+            self.writer.edit_in_place(path, lambda p: apply_playlist_tags(
+                p, self.config.node_name, album, index, src_rel, pid))
 
         with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
             list(pool.map(_apply, fix_jobs))
@@ -505,7 +502,7 @@ class PlaylistManager:
                         track_path = folder_path / cur_name
             if not track_path.exists():
                 continue
-            restore_tags(track_path, tags)
+            self.writer.edit_in_place(track_path, lambda p, tags=tags: restore_tags(p, tags))
             restored += 1
 
         return restored
@@ -581,7 +578,7 @@ class PlaylistManager:
             track_path = folder_path / entry["copy_name"]
             tags = entry.get("tags")
             if track_path.exists() and tags:
-                restore_tags(track_path, tags)
+                self.writer.edit_in_place(track_path, lambda p, tags=tags: restore_tags(p, tags))
                 restored += 1
                 new_tracks.append({
                     "index": entry["index"],
@@ -747,10 +744,9 @@ class PlaylistManager:
         def _apply_tags(t):
             track_path = folder_path / t["copy_name"]
             if track_path.exists():
-                apply_playlist_tags(
-                    track_path, self.config.node_name, album,
-                    t["index"], "", pid,
-                )
+                self.writer.edit_in_place(track_path, lambda p: apply_playlist_tags(
+                    p, self.config.node_name, album, t["index"], "", pid,
+                ))
 
         with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
             list(pool.map(_apply_tags, self.store.playlists[pid]["tracks"]))

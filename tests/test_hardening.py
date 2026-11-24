@@ -1,7 +1,10 @@
 """Hardening tests — large playlists, cross-playlist sync, corrupt data,
 workspace locking, atomic writes, sync journal, and edge cases."""
 
+import builtins
+import errno
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -11,6 +14,7 @@ import pytest
 from mutagen.flac import FLAC
 
 from echolist.manager import PlaylistManager, WorkspaceLockError
+import echolist.safe_write as safe_write
 from echolist.safe_write import SafeWriter, atomic_write_text
 from echolist.config import (
     load_backup, list_backups, save_backup, load_playlist_snapshot,
@@ -225,27 +229,44 @@ def test_atomic_write_text_creates_file(tmp_path):
     assert json.loads(p.read_text(encoding="utf-8")) == {"hello": "world"}
 
 
-def test_atomic_write_text_overwrites_safely(tmp_path):
-    """Overwriting an existing file via atomic_write_text preserves old content on failure."""
+def test_atomic_write_text_overwrites_safely(tmp_path, monkeypatch):
+    """If the final rename fails, the old file is untouched and no temp file
+    is left behind."""
     p = tmp_path / "data.json"
     atomic_write_text(p, '{"version": 1}')
-    assert json.loads(p.read_text(encoding="utf-8"))["version"] == 1
 
-    atomic_write_text(p, '{"version": 2}')
-    assert json.loads(p.read_text(encoding="utf-8"))["version"] == 2
+    def replace_fails(a, b):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(safe_write.os, "replace", replace_fails)
+    with pytest.raises(OSError):
+        atomic_write_text(p, '{"version": 2}')
+
+    assert json.loads(p.read_text(encoding="utf-8")) == {"version": 1}
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["data.json"]
 
 
-def test_atomic_write_no_partial_on_disk(tmp_path):
-    """If write fails, the original file content is preserved."""
+def test_atomic_write_no_partial_on_disk(tmp_path, monkeypatch):
+    """A write that stops part-way (disk full) never reaches the target."""
     p = tmp_path / "data.json"
     atomic_write_text(p, '{"original": true}')
+    real_write = os.write
+    calls = []
 
-    original = p.read_text(encoding="utf-8")
-    assert "original" in original
+    def short_then_full(fd, data):
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(fd, bytes(data[:3]))  # short write
+        raise OSError(errno.ENOSPC, "No space left on device")
 
-    # Verify content still intact after successful write
-    atomic_write_text(p, '{"updated": true}')
-    assert "updated" in p.read_text(encoding="utf-8")
+    monkeypatch.setattr(safe_write.os, "write", short_then_full)
+    with pytest.raises(OSError) as e:
+        atomic_write_text(p, '{"updated": true, "pad": "' + "x" * 100 + '"}')
+
+    assert e.value.errno == errno.ENOSPC
+    assert len(calls) == 2  # the short write was retried, not taken as done
+    assert json.loads(p.read_text(encoding="utf-8")) == {"original": True}
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["data.json"]
 
 
 # ── Workspace lock ──
@@ -408,19 +429,26 @@ def test_add_track_missing_source_raises(manager, source):
         manager.add_track(pid, source / "nonexistent.flac")
 
 
-def test_add_track_source_deleted_after_resolve(manager, source):
-    """If source is deleted between check and copy, SafeWriter raises."""
+def test_add_track_source_deleted_after_resolve(manager, source, monkeypatch):
+    """The source vanishes after add_track checked it but before SafeWriter
+    opens it: nothing is published, no partial copy is left, the Store is
+    unchanged."""
     pid = manager.create_playlist("Test")
     src = source / "ArtistA" / "Album1" / "01 Song One.flac"
+    real_open = builtins.open
 
-    # File exists at this point
-    assert src.exists()
+    def open_after_delete(file, mode="r", *a, **kw):
+        if Path(file) == src.resolve() and "r" in mode:
+            src.unlink()  # deleted between the check and the copy
+        return real_open(file, mode, *a, **kw)
 
-    # Delete it to simulate race condition
-    src.unlink()
-
+    monkeypatch.setattr(safe_write, "open", open_after_delete, raising=False)
     with pytest.raises(FileNotFoundError):
         manager.add_track(pid, src)
+
+    assert not src.exists()
+    assert list((manager.writer.root / "Test").iterdir()) == []
+    assert manager.store.playlists[pid]["tracks"] == []
 
 
 # ── Backup edge cases ──
