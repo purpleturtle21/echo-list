@@ -22,8 +22,10 @@ import platform
 import string
 from datetime import datetime
 
-from .manager import PlaylistManager, WorkspaceLockError, AUDIO_EXTS
-from .naming import pad_width, playlist_id, sanitize, track_filename
+from .manager import (PlaylistManager, WorkspaceLockError, AUDIO_EXTS, TMP_PREFIX,
+                      _name_key)
+from .naming import (check_playlist_folder_name, pad_width, playlist_id, sanitize,
+                     track_filename)
 from .config import (load_defaults, save_defaults, DEFAULT_PLAYLIST_FOLDER,
                      journal_file, pending_file, validate_playlist_folder)
 from .journal import INCOMPLETE, SyncJournal
@@ -468,6 +470,29 @@ class StagingState:
         return committed + len(self.pending_adds) - len(self.pending_removes)
 
 
+def _restore_order(committed: int, staged_at: list) -> list[dict] | None:
+    """Reorder that puts re-staged tracks back at their restore-point
+    positions (1-based, from restore_playlist_to_point's "to_stage").
+
+    The restore keeps the tracks still on the card in restore-point order as
+    c:1..c:N; staged add j (p:j) goes back to position staged_at[j]. Returns
+    None when that is the default order (committed tracks, then the adds).
+    """
+    if not staged_at or any(i is None for i in staged_at):
+        return None
+    order = []
+    c = 1
+    for j, pos in enumerate(staged_at):
+        while len(order) < pos - 1 and c <= committed:
+            order.append({"key": f"c:{c}"})
+            c += 1
+        order.append({"key": f"p:{j}"})
+    order += [{"key": f"c:{i}"} for i in range(c, committed + 1)]
+    default = ([f"c:{i}" for i in range(1, committed + 1)]
+               + [f"p:{j}" for j in range(len(staged_at))])
+    return None if [e["key"] for e in order] == default else order
+
+
 class StagingLoadError(Exception):
     """pending.json exists but cannot be read; refuse to start with it empty."""
 
@@ -501,8 +526,7 @@ def _bind_legacy_staging(staging_path: Path, store) -> None:
 _FATAL_ERRNOS = {e for e in (errno.ENOSPC, errno.EIO, errno.EROFS, errno.ENODEV,
                              errno.ENXIO, getattr(errno, "EDQUOT", None)) if e}
 
-TMP_PREFIX = "_echolist_tmp_"
-_TMP_RE = re.compile(r"^_echolist_tmp_\d+_(.+)$")
+_TMP_RE = re.compile(r"^" + re.escape(TMP_PREFIX) + r"\d+_(.+)$")
 COPY_PART_GLOB = ".echolist-copy-*.part"
 
 
@@ -805,12 +829,13 @@ def _commit_reorder(mgr, pid: str, plan: list[dict], token: str | None = None) -
     errors = []
     album = mgr.config.album_prefix + playlist["name"]
     for t in new_tracks:
-        path = mgr.writer.resolve(f"{folder}/{t['copy_name']}")
-        if not tags_supported(path):
+        rel = f"{folder}/{t['copy_name']}"
+        if not tags_supported(mgr.writer.resolve(rel)):
             continue
         try:
-            apply_playlist_tags(path, mgr.config.node_name, album, t["index"],
-                                t.get("src_path", ""), pid)
+            # edit_in_place drops the ._ sidecar macOS re-creates on FAT32.
+            mgr.writer.edit_in_place(rel, lambda p, t=t: apply_playlist_tags(
+                p, mgr.config.node_name, album, t["index"], t.get("src_path", ""), pid))
         except Exception as e:  # file order is right; "Fix metadata" can retry tags
             errors.append(f"Tag {t['copy_name']}: {e}")
     return errors
@@ -1699,20 +1724,17 @@ class App:
         self._adopt_manager(mgr, snap_source, dest)
 
         missing_sources = []
+        refused = []
         source_root = Path(snap_source)
         for pl in playlists.values():
             # create_playlist returns playlist_id(name), which differs from
             # the snapshot's pid for older or renamed playlists: stage there.
             try:
                 pid = mgr.create_playlist(pl["name"])
-            except ValueError:
-                # Already there (a duplicate name in the snapshot): add to it.
-                pid = next((p for p, x in mgr.store.playlists.items()
-                            if x["name"] == pl["name"]), None)
-                if pid is None:
-                    missing_sources.extend(t["src_path"] for t in pl.get("tracks", [])
-                                           if t.get("src_path"))
-                    continue
+            except ValueError as e:
+                # e.g. the folder is already on the card (adopt it instead)
+                refused.append(f"'{pl['name']}': {e}")
+                continue
             for t in pl.get("tracks", []):
                 src_path = t.get("src_path", "")
                 if not src_path:
@@ -1726,6 +1748,11 @@ class App:
 
         self._show_main()
 
+        if refused:
+            messagebox.showwarning(
+                "Some playlists not restored",
+                "These playlists were not restored:\n\n"
+                + "\n".join(f"  - {r}" for r in refused[:10]))
         if missing_sources:
             n = len(missing_sources)
             sample = "\n".join(f"  - {s}" for s in missing_sources[:10])
@@ -2102,13 +2129,9 @@ class App:
         playlist = self.mgr.store.playlists.get(pid)
         if not playlist:
             return
-        if self._playlist_has_pending(pid):
-            messagebox.showinfo(
-                "Pending changes",
-                f"'{playlist['name']}' has staged changes. Sync or undo them "
-                f"before restoring the playlist.")
-            return
         label = _format_backup_timestamp(timestamp)
+        pending_note = ("\nThe changes staged for this playlist will be discarded.\n"
+                        if self._playlist_has_pending(pid) else "")
         confirm = messagebox.askyesno(
             "Restore to point",
             f"Restore playlist '{playlist['name']}' to '{label}'?\n\n"
@@ -2116,7 +2139,8 @@ class App:
             f"- Tracks added since then will be removed\n"
             f"- Tracks deleted since then will be re-staged for sync\n"
             f"- Metadata will be restored on remaining tracks\n\n"
-            f"A restore point of the current state will be saved first.\n\n"
+            f"A restore point of the current state will be saved first.\n"
+            f"{pending_note}\n"
             f"Continue?",
         )
         if not confirm:
@@ -2127,16 +2151,24 @@ class App:
             return self.mgr.restore_playlist_to_point(pid, timestamp)
 
         def on_done(result):
+            # Staged changes were keyed to the playlist as it was; the restore
+            # rewrote it (the undo stack is cleared by _run_playlist_op).
+            self.staging.drop_pid(pid)
             source_root = Path(self.mgr.config.source_root).resolve()
             missing = []
-            for s in result["to_stage"]:
+            staged_at = []  # restore-point position of each staged add, p:0..
+            for s in sorted(result["to_stage"], key=lambda e: e.get("index", 0)):
                 src_path = s["src_path"]
                 full = _resolve_source_file(src_path, source_root)
                 if full:
                     title, artist = _read_tags_from_file(full)
                     self.staging.stage_add(pid, str(full), title, artist)
+                    staged_at.append(s.get("index"))
                 else:
                     missing.append(src_path)
+            order = _restore_order(len(self.mgr.store.playlists[pid]["tracks"]), staged_at)
+            if order is not None:
+                self.staging.set_reorder(pid, order)
 
             self._invalidate_caches(pid)
             self._refresh_playlists()
@@ -2154,7 +2186,15 @@ class App:
                     parts.append(f"Staged {staged} track(s) for re-syncing.")
             if missing:
                 parts.append(f"{len(missing)} source file(s) could not be found.")
-            messagebox.showinfo("Playlist restored", "\n".join(parts) if parts else "No changes needed.")
+            failed = result.get("failed", [])
+            if failed:
+                listed = "\n".join(f"  - {f}" for f in failed[:10])
+                more = f"\n  ... and {len(failed) - 10} more" if len(failed) > 10 else ""
+                parts.append(f"\nNot restored:\n{listed}{more}")
+                messagebox.showwarning("Playlist partly restored", "\n".join(parts))
+            else:
+                messagebox.showinfo("Playlist restored",
+                                    "\n".join(parts) if parts else "No changes needed.")
 
         self._run_playlist_op(pid, name, restore, on_done)
 
@@ -3505,11 +3545,17 @@ class App:
         pl = self.mgr.store.playlists[pid]
         old_folder = pl["folder"]
         new_folder = sanitize(new_name)
-        # FAT32 folder names are case-insensitive (same rule as
-        # PlaylistManager.create_playlist), and an older store's pid may not
-        # match playlist_id(), so compare folders, not only pids.
+        try:
+            check_playlist_folder_name(new_folder)
+        except ValueError as e:
+            messagebox.showerror("Invalid name", str(e))
+            return False
+        # FAT32 folder names are case-insensitive and macOS treats NFC/NFD
+        # forms as one name (same rule as PlaylistManager.create_playlist);
+        # an older store's pid may not match playlist_id(), so compare
+        # folders, not only pids.
         for other_pid, other in self.mgr.store.playlists.items():
-            if other_pid != pid and other["folder"].casefold() == new_folder.casefold():
+            if other_pid != pid and _name_key(other["folder"]) == _name_key(new_folder):
                 messagebox.showerror(
                     "Error",
                     f"Playlist folder '{new_folder}' is already used by "
@@ -3519,8 +3565,9 @@ class App:
         # Rename folder on disk first — abort if it fails
         if old_folder != new_folder:
             try:
-                if old_folder.casefold() == new_folder.casefold():
-                    # Case-only rename: FAT32 (vfat) refuses a direct rename.
+                if _name_key(old_folder) == _name_key(new_folder):
+                    # Case/Unicode-form-only rename: FAT32 (vfat) refuses a
+                    # direct rename.
                     step = f"{new_folder}.echolist-rename"
                     self.mgr.writer.rename(old_folder, step)
                     self.mgr.writer.rename(step, new_folder)

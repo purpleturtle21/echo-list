@@ -112,3 +112,57 @@ def test_declining_an_orphan_remove_still_clears_the_shifted_reorder(app, gui_en
 
     assert [a["title"] for a in app.staging.pending_adds] == ["Song Three"]
     assert pid not in app.staging.pending_reorders
+
+
+# ── Rename checks the folder name the way the card does ──
+
+
+def test_rename_refuses_a_dot_folder(app, gui_env):
+    pid = _synced_playlist(app, gui_env, 1)
+    folder = app.mgr.store.playlists[pid]["folder"]
+    with patch("echolist.gui.messagebox.showerror") as err:
+        assert not app._rename_playlist(pid, ".Hidden")
+    err.assert_called_once()
+    assert app.mgr.store.playlists[pid]["folder"] == folder
+    assert (app.mgr.writer.root / folder).is_dir()
+
+
+def test_rename_refuses_a_folder_differing_only_in_unicode_form(app, gui_env):
+    """macOS (and so the card as macOS sees it) treats NFC and NFD names as
+    one; the casefold-only compare let two playlists share a folder."""
+    app.mgr.create_playlist("Café")
+    pid = _synced_playlist(app, gui_env, 1)
+    with patch("echolist.gui.messagebox.showerror") as err:
+        assert not app._rename_playlist(pid, "CAFÉ")
+    err.assert_called_once()
+
+
+# ── Reorder retags through the writer; one TMP_PREFIX ──
+
+
+def test_reorder_retags_through_writer_edit_in_place(app, gui_env):
+    """Tag writes re-create macOS ._ sidecars on FAT32; edit_in_place drops
+    them. _commit_reorder wrote the tags directly."""
+    pid = _synced_playlist(app, gui_env, 2)
+    app.staging.set_reorder(pid, [{"key": "c:2"}, {"key": "c:1"}])
+    real = app.mgr.writer.edit_in_place
+    edited = []
+
+    def spy(rel, edit):
+        edited.append(Path(rel).name)
+        return real(rel, edit)
+
+    with patch.object(app.mgr.writer, "edit_in_place", side_effect=spy):
+        assert app._do_sync_blocking() == []
+    assert sorted(edited) == ["01 - Song Two.flac", "02 - Song One.flac"]
+
+
+def test_gui_does_not_redefine_tmp_prefix():
+    """The parking prefix is defined once, in manager.py (rescan ignores it,
+    recovery restores it); gui.py must import it, not keep a copy."""
+    import inspect
+    import re
+    from echolist import manager
+    assert not re.search(r"^TMP_PREFIX\s*=", inspect.getsource(gui), re.M), (
+        "gui.py defines TMP_PREFIX; use `from .manager import TMP_PREFIX`")
+    assert gui.TMP_PREFIX == manager.TMP_PREFIX

@@ -35,7 +35,8 @@ from .tags import (
 )
 
 # Prefix of a track parked mid-rename ("_echolist_tmp_<n>_<original name>").
-# Rescan never adopts such a file.
+# Rescan never adopts such a file; opening the workspace renames it back
+# (gui._restore_stranded_temp_files), so a crash never strands audio.
 TMP_PREFIX = "_echolist_tmp_"
 
 LOCK_REL = ".echolist/workspace.lock"
