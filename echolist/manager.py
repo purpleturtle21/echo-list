@@ -14,7 +14,8 @@ from pathlib import Path
 
 from .safe_write import SafeWriter, UnsafeWriteError
 from .config import (
-    Config, DEFAULT_PLAYLIST_FOLDER,
+    CONFIG_REL, Config, DEFAULT_PLAYLIST_FOLDER,
+    bind_workspace_state, new_workspace_uuid,
     save_backup, list_backups, list_all_backup_pids, load_backup,
     save_playlist_snapshot, load_playlist_snapshot,
 )
@@ -61,11 +62,12 @@ class PlaylistManager:
             album_prefix=album_prefix,
             playlist_folder=playlist_folder,
             backup_interval=backup_interval,
+            workspace_uuid=_existing_uuid(writer),
         )
         store = Store.load(writer)
         mgr = cls(writer, config, store)
         mgr._acquire_lock()
-        config.save(writer)
+        mgr._bind_workspace_state()
         return mgr
 
     @classmethod
@@ -81,7 +83,16 @@ class PlaylistManager:
         store = Store.load(writer)
         mgr = cls(writer, config, store)
         mgr._acquire_lock()
+        mgr._bind_workspace_state()
         return mgr
+
+    def _bind_workspace_state(self) -> None:
+        """Give the card a UUID if it has none (saving config), then move any
+        mount-path-keyed local state to it (see config.bind_workspace_state)."""
+        if not self.config.workspace_uuid:
+            self.config.workspace_uuid = new_workspace_uuid()
+        self.config.save(self.writer)
+        bind_workspace_state(self.writer.root, self.store.playlists.keys())
 
     def _acquire_lock(self) -> None:
         try:
@@ -787,6 +798,17 @@ class PlaylistManager:
     def find_snapshot(dest_root: str | Path, playlist_folder: str = DEFAULT_PLAYLIST_FOLDER) -> dict | None:
         workspace_root = Path(dest_root).resolve() / playlist_folder
         return load_playlist_snapshot(workspace_root)
+
+
+def _existing_uuid(writer: SafeWriter) -> str:
+    """The workspace UUID already on the card (re-init keeps the card's
+    identity), or "" if there is none or the config is unreadable."""
+    if not (writer.root / CONFIG_REL).exists():
+        return ""
+    try:
+        return Config.load(writer).workspace_uuid
+    except (ValueError, OSError):
+        return ""
 
 
 def _is_real_audio(p: Path) -> bool:

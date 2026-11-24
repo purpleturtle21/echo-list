@@ -72,13 +72,13 @@ ALLOWED_CALLS = {
     ("config.py", "rename_backup_pid"): {
         "mkdir": "~/.echolist backups dir", "unlink": "moved backup file",
         "rename": "move backup file between pid dirs",
-        "rmdir": "empty ~/.echolist backup dir after the move",
     },
-    ("config.py", "delete_all_backups"): {
-        "unlink": "user-requested permanent delete of backups",
-        "rmdir": "empty ~/.echolist backup dir after the delete",
-    },
+    ("config.py", "_remove_empty_dirs"): {"rmdir": "empty ~/.echolist backup dirs"},
+    ("config.py", "delete_all_backups"): {"unlink": "user-requested permanent delete of backups"},
     ("config.py", "save_playlist_snapshot"): {"mkdir": "~/.echolist/backups/<wid>"},
+    ("config.py", "bind_workspace_state"): {
+        "rename": "move ~/.echolist/backups/<path hash> to the card's UUID key",
+    },
     # ── journal.py: ~/.echolist/backups/<wid>/sync_journal.json ──
     ("journal.py", "SyncJournal.discard"): {"unlink": "remove finished journal (local state)"},
     # ── gui.py: ~/.echolist local state ──
