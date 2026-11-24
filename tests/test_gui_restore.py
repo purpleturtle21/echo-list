@@ -10,6 +10,7 @@ from test_gui import (app, gui_env, isolated_home, callback_errors, pump)  # noq
 from test_gui_sync_safety import (_sources, _titles, _disk_names,
                                   _synced_playlist, _reopen)
 from test_gui_concurrency import _quiet
+from test_gui_sync_engine import _track
 
 
 # ── Offload and delete never lose the restore point ──
@@ -66,3 +67,90 @@ def test_onload_uses_the_restore_point_the_offload_saved(app, gui_env):
         app._onload_playlist(pid)
         pump(app)
     assert [a["title"] for a in app.staging.pending_adds] == ["Song One", "Song Two"]
+
+
+# ── Restores stage under the playlist they actually created ──
+
+
+def test_snapshot_restore_stages_under_the_created_playlist_id(app, gui_env, tmp_path):
+    """Snapshot restore staged adds under the snapshot's (legacy) pid
+    although create_playlist() returned a different one, so every restored
+    track failed to sync."""
+    card = tmp_path / "card2"
+    card.mkdir()
+    snapshot = {
+        "config": {"source_root": str(gui_env["src"]),
+                   "playlist_folder": gui.DEFAULT_PLAYLIST_FOLDER},
+        "store": {"schema": 1, "playlists": {"ac/dc": {
+            "name": "AC/DC", "folder": "AC_DC",
+            "tracks": [{"index": 1, "copy_name": "01 - Song One.flac",
+                        "src_path": "ArtistA/Album1/01 Song One.flac"}]}}},
+    }
+    app.mgr.release_lock()
+    with patch.object(gui.PlaylistManager, "find_snapshot", return_value=snapshot), \
+            patch("echolist.gui.messagebox.askyesno", return_value=True), \
+            patch("echolist.gui.messagebox.showwarning"), \
+            patch("echolist.gui.messagebox.showinfo"):
+        app._open_workspace(str(gui_env["src"]), str(card))
+    pump(app)
+
+    [pid] = list(app.mgr.store.playlists)
+    assert [a["pid"] for a in app.staging.pending_adds] == [pid]
+    assert app._do_sync_blocking() == []
+    assert _titles(app, pid) == ["Song One"]
+
+
+def test_restore_deleted_stages_under_the_recreated_playlist_id(app, gui_env):
+    """A backup kept under an old pid ('old_mix') recreated the
+    playlist as playlist_id(name) but staged its tracks under 'old_mix'."""
+    from echolist.config import save_backup
+    from echolist.naming import playlist_id
+    save_backup(app.mgr.writer.root, "old_mix", "20200101_000000", {
+        "playlist_name": "Mix", "folder": "Mix",
+        "tracks": [{"copy_name": "01 - Song One.flac", "index": 1,
+                    "src_path": "ArtistA/Album1/01 Song One.flac"}]})
+    with _quiet():
+        app._restore_deleted("old_mix", "20200101_000000")
+        pump(app)
+
+    pid = playlist_id("Mix")
+    assert [a["pid"] for a in app.staging.pending_adds] == [pid]
+    assert app._do_sync_blocking() == []
+    assert _titles(app, pid) == ["Song One"]
+
+
+# ── Restore points and staged changes ──
+
+
+def test_restore_point_is_refused_while_the_playlist_has_staged_changes(app, gui_env):
+    """Restoring rewrote the playlist under staged removes/reorders
+    whose indices then pointed at other tracks."""
+    pid = _synced_playlist(app, gui_env, 2)
+    app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
+    app._stage_remove_track(pid, 1, _track(app, pid, 1)["copy_name"])
+    with patch.object(app.mgr, "restore_playlist_to_point") as restore, _quiet():
+        app._restore_from_point(pid, "20200101_000000")
+        pump(app)
+    restore.assert_not_called()
+    assert len(app.staging.pending_removes) == 1
+
+
+def test_undo_after_a_restore_does_not_unstage_its_tracks(app, gui_env):
+    """Undo snapshots taken before a structural operation survived
+    it; undoing then silently dropped the tracks the restore had staged."""
+    pid = _synced_playlist(app, gui_env, 2)
+    app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
+    app._stage_remove_track(pid, 2, _track(app, pid, 2)["copy_name"])
+    assert app._do_sync_blocking() == []
+    app._create_playlist()
+    other = app.current_pid
+    app._stage_add_files(_sources(gui_env)[2:3])   # leaves an undo entry
+    app.current_pid = pid
+
+    with _quiet():
+        app._restore_from_point(pid, "20200101_000000")
+        pump(app)
+    assert any(a["pid"] == pid for a in app.staging.pending_adds)
+    app._do_undo()
+    assert any(a["pid"] == pid for a in app.staging.pending_adds)
+    assert any(a["pid"] == other for a in app.staging.pending_adds)

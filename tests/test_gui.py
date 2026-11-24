@@ -668,24 +668,14 @@ class TestPlaylistRename:
     """Test inline rename and its interaction with backups."""
 
     def _do_rename(self, app, old_pid, new_name):
-        """Simulate the commit() logic from _start_inline_rename."""
-        from echolist.naming import playlist_id, sanitize
+        """Rename through the inline-rename entry, the way a user does (this used
+        to re-implement the commit logic inline)."""
+        from echolist.naming import playlist_id
+        from test_gui_sync_safety import _rename_via_entry
+        app.current_pid = old_pid
+        _rename_via_entry(app, old_pid, new_name)
         new_pid = playlist_id(new_name)
-        pl = app.mgr.store.playlists[old_pid]
-        old_folder = pl["folder"]
-        new_folder = sanitize(new_name)
-        if old_folder != new_folder:
-            app.mgr.writer.rename(old_folder, new_folder)
-        pl["name"] = new_name
-        pl["folder"] = new_folder
-        if new_pid != old_pid:
-            from echolist.config import rename_backup_pid
-            app.mgr.store.playlists[new_pid] = pl
-            del app.mgr.store.playlists[old_pid]
-            app.current_pid = new_pid
-            rename_backup_pid(app.mgr.writer.root, old_pid, new_pid, new_folder)
-        app._invalidate_caches(new_pid if new_pid != old_pid else old_pid)
-        app.mgr.store.save()
+        assert new_pid in app.mgr.store.playlists
         return new_pid
 
     def test_rename_changes_folder_and_store(self, app, gui_env):
@@ -797,7 +787,13 @@ class TestPlaylistRename:
 
 class TestAuditCacheInvalidation:
     """Verify that the audit cache is cleared after every metadata mutation,
-    so Fix metadata always reflects the current state."""
+    so Fix metadata always reflects the current state.
+
+    Each test drives the real App action (restore, sync, Fix metadata,
+    rename, offload) instead of calling manager methods and
+    _invalidate_caches() by hand, which could not catch a missing call."""
+
+    STALE = [{"fake": "stale"}]
 
     def _sync_and_prime_cache(self, app, gui_env):
         """Create playlist, sync a track, and prime the audit cache."""
@@ -814,119 +810,97 @@ class TestAuditCacheInvalidation:
         assert issues == []
         return pid
 
+    def _assert_fresh(self, app, pid):
+        """The cache holds nothing for pid, or exactly a fresh audit."""
+        fresh = app.mgr.audit_playlist_metadata(pid)
+        assert app._audit_cache.get(pid, fresh) == fresh
+        return fresh
+
+    def _quiet(self):
+        return patch.multiple("echolist.gui.messagebox",
+                              askyesno=lambda *a, **k: True,
+                              showinfo=lambda *a, **k: None,
+                              showwarning=lambda *a, **k: None)
+
     def test_restore_invalidates_audit_cache(self, app, gui_env):
-        """After restoring metadata from before_echolist, audit cache must be
-        cleared so Fix metadata catches the now-wrong tags."""
+        """After restoring a restore point with other tags, the audit cache
+        must be cleared so Fix metadata catches the now-wrong tags."""
         pid = self._sync_and_prime_cache(app, gui_env)
 
-        # Corrupt tags to simulate "before_echolist" state, then backup
         pl = app.mgr.store.playlists[pid]
         track_path = app.mgr.writer.root / pl["folder"] / pl["tracks"][0]["copy_name"]
         from mutagen.flac import FLAC
         f = FLAC(track_path)
         f["ALBUM"] = "Original Album"
         f.save()
-        app.mgr.backup_playlist_metadata(pid)
-
-        # Fix the tags back so audit cache is "clean"
+        app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
         app.mgr.fix_playlist_metadata(pid)
         app._audit_cache[pid] = []
 
-        # Now restore from the backup (puts back "Original Album")
-        from echolist.config import list_backups
-        backups = list_backups(app.mgr.writer.root, pid)
-        app.mgr.restore_playlist_metadata(pid, backups[0]["timestamp"])
-        app._invalidate_caches(pid)
+        with self._quiet():
+            app._restore_from_point(pid, "20200101_000000")
+            _flush_bg_ops(app)
 
-        # Cache should be cleared
-        assert pid not in app._audit_cache
-        # Fresh audit should detect the mismatch
-        issues = app.mgr.audit_playlist_metadata(pid)
-        album_issues = [i for i in issues if i["field"] == "album"]
-        assert len(album_issues) >= 1
+        issues = self._assert_fresh(app, pid)
+        assert [i for i in issues if i["field"] == "album"]
 
     def test_sync_invalidates_audit_cache(self, app, gui_env):
         """After sync, audit cache must be cleared."""
         pid = self._sync_and_prime_cache(app, gui_env)
-
-        # Add another track and sync
         src2 = gui_env["src"] / "ArtistB" / "Album2" / "03 Song Two.flac"
         app._stage_add_files([src2])
+        app._audit_cache[pid] = self.STALE
 
-        # Manually put stale data in cache
-        app._audit_cache[pid] = [{"fake": "stale"}]
+        app._do_sync()
+        _flush_bg_ops(app)
 
-        app._do_sync_blocking()
-        # _do_sync_blocking doesn't invalidate (only used at close),
-        # but _do_sync does — verify via _invalidate_caches directly
-        app._invalidate_caches()
-        assert pid not in app._audit_cache
+        assert app._audit_cache.get(pid) != self.STALE
+        self._assert_fresh(app, pid)
 
     def test_fix_metadata_invalidates_audit_cache(self, app, gui_env):
         """After fixing metadata, audit cache must be cleared."""
         pid = self._sync_and_prime_cache(app, gui_env)
-
-        # Corrupt tags so audit finds issues
         pl = app.mgr.store.playlists[pid]
         track_path = app.mgr.writer.root / pl["folder"] / pl["tracks"][0]["copy_name"]
         from mutagen.flac import FLAC
         f = FLAC(track_path)
         f["ALBUM"] = "WRONG"
         f.save()
+        app._audit_cache[pid] = self.STALE
 
-        # Invalidate so audit re-runs
-        app._invalidate_caches(pid)
-        issues = app.mgr.audit_playlist_metadata(pid)
-        assert len(issues) > 0
+        app.current_pid = pid
+        with self._quiet():
+            app._fix_metadata_clicked()
+            _flush_bg_ops(app)
 
-        # Fix metadata
-        app.mgr.fix_playlist_metadata(pid)
-        app._invalidate_caches(pid)
-
-        # Cache should be cleared, fresh audit should be clean
-        assert pid not in app._audit_cache
-        assert app.mgr.audit_playlist_metadata(pid) == []
+        assert self._assert_fresh(app, pid) == []
 
     def test_rename_invalidates_audit_cache(self, app, gui_env):
         """After rename, audit cache for the new pid should not have stale data."""
-        from echolist.naming import playlist_id, sanitize
-        from echolist.config import rename_backup_pid
-
+        from echolist.naming import playlist_id
+        from test_gui_sync_safety import _rename_via_entry
         pid = self._sync_and_prime_cache(app, gui_env)
+        new_pid = playlist_id("Renamed Audit")
+        app._audit_cache[new_pid] = self.STALE
 
-        # Rename
-        new_name = "Renamed Audit"
-        new_pid = playlist_id(new_name)
-        new_folder = sanitize(new_name)
-        pl = app.mgr.store.playlists[pid]
-        old_folder = pl["folder"]
-        app.mgr.writer.rename(old_folder, new_folder)
-        pl["name"] = new_name
-        pl["folder"] = new_folder
-        if new_pid != pid:
-            app.mgr.store.playlists[new_pid] = pl
-            del app.mgr.store.playlists[pid]
-            app.current_pid = new_pid
-            rename_backup_pid(app.mgr.writer.root, pid, new_pid, new_folder)
-        app._invalidate_caches(new_pid)
-        app.mgr.store.save()
+        _rename_via_entry(app, pid, "Renamed Audit")
+        _flush_bg_ops(app)
 
-        # Cache should not have stale data for new pid
-        assert new_pid not in app._audit_cache
-        # Audit should flag album mismatch (old name baked into tags)
-        issues = app.mgr.audit_playlist_metadata(new_pid)
-        album_issues = [i for i in issues if i["field"] == "album"]
-        assert len(album_issues) >= 1
+        assert app._audit_cache.get(new_pid) != self.STALE
+        issues = self._assert_fresh(app, new_pid)
+        # The old name is still baked into the album tag.
+        assert [i for i in issues if i["field"] == "album"]
 
     def test_offload_invalidates_audit_cache(self, app, gui_env):
         """Offload should clear audit cache for the playlist."""
         pid = self._sync_and_prime_cache(app, gui_env)
+        app._audit_cache[pid] = self.STALE
 
-        # Put stale data in cache
-        app._audit_cache[pid] = [{"fake": "stale"}]
+        with self._quiet():
+            app._offload_playlist(pid)
+            _flush_bg_ops(app)
 
-        # Simulate offload
-        app._invalidate_caches(pid)
+        assert app.mgr.store.playlists[pid]["offloaded"] is True
         assert pid not in app._audit_cache
 
 
@@ -1106,33 +1080,11 @@ class TestOffloadOnload:
         assert not folder_path.exists()
 
     def _do_onload(self, app, pid):
-        """Simulate onload logic inline (avoids threading complexity in tests)."""
-        from echolist.config import load_backup, list_backups
-        from echolist.gui import _resolve_source_file, _read_tags_from_file
-
-        backups = list_backups(app.mgr.writer.root, pid)
-        assert len(backups) >= 1
-        data = load_backup(app.mgr.writer.root, pid, backups[0]["timestamp"])
-        assert data is not None
-
-        pl = app.mgr.store.playlists[pid]
-        pl["offloaded"] = False
-        pl["tracks"] = []
-        app.mgr.store.save()
-
-        folder = pl["folder"]
-        (app.mgr.writer.root / folder).mkdir(parents=True, exist_ok=True)
-
-        source_root = Path(app.mgr.config.source_root)
-        for entry in data.get("tracks", []):
-            src_path = entry.get("src_path", "")
-            if not src_path:
-                continue
-            full = _resolve_source_file(src_path, source_root)
-            if full:
-                title, artist = _read_tags_from_file(full)
-                app.staging.stage_add(pid, str(full), title, artist)
-        app._invalidate_caches(pid)
+        """Onload through the real App action and its background worker (this used
+        to re-implement the onload logic inline)."""
+        with patch("echolist.gui.messagebox.showinfo"):
+            app._onload_playlist(pid)
+            _flush_bg_ops(app)
 
     def test_onload_stages_tracks_for_sync(self, app, gui_env):
         """Onload must stage tracks from backup for re-syncing."""

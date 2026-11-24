@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import errno
+import glob
 import json
 import re
 import sys
@@ -108,15 +109,31 @@ _HIDDEN_DIRS = frozenset({
 })
 
 
-def _read_tags_from_file(path: Path) -> tuple[str, str]:
+def _read_title_artist(path: Path) -> tuple[str, str]:
+    """Title and artist from a file's tags ("" when absent or unreadable).
+
+    tags.read_playlist_tags reads FLAC, MP3, MP4 and the ID3 chunks of
+    WAV/AIFF (mutagen's easy interface has no title key for those); other
+    formats (OGG, WMA, ...) fall back to mutagen's easy keys.
+    """
+    import mutagen
+    from .tags import read_playlist_tags
+    tags = read_playlist_tags(path)
+    if tags["title"] or tags["artist"]:
+        return tags["title"], tags["artist"]
     try:
-        import mutagen
         m = mutagen.File(path, easy=True)
-        if m:
-            return m.get("title", [""])[0], m.get("artist", [""])[0]
-    except Exception:
-        pass
-    return path.stem, ""
+    except (mutagen.MutagenError, OSError):
+        return "", ""
+    if not m:
+        return "", ""
+    return (m.get("title") or [""])[0], (m.get("artist") or [""])[0]
+
+
+def _read_tags_from_file(path: Path) -> tuple[str, str]:
+    """Title (else the file name) and artist, for display and staging."""
+    title, artist = _read_title_artist(path)
+    return title or path.stem, artist
 
 
 def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
@@ -161,7 +178,7 @@ def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
         search_roots.append(source_root.parent)
     for root in search_roots:
         try:
-            for hit in root.rglob(name):
+            for hit in root.rglob(glob.escape(name)):
                 if hit.is_file():
                     return hit.resolve()
         except OSError:
@@ -1683,11 +1700,19 @@ class App:
 
         missing_sources = []
         source_root = Path(snap_source)
-        for pid, pl in playlists.items():
+        for pl in playlists.values():
+            # create_playlist returns playlist_id(name), which differs from
+            # the snapshot's pid for older or renamed playlists: stage there.
             try:
-                mgr.create_playlist(pl["name"])
+                pid = mgr.create_playlist(pl["name"])
             except ValueError:
-                pass
+                # Already there (a duplicate name in the snapshot): add to it.
+                pid = next((p for p, x in mgr.store.playlists.items()
+                            if x["name"] == pl["name"]), None)
+                if pid is None:
+                    missing_sources.extend(t["src_path"] for t in pl.get("tracks", [])
+                                           if t.get("src_path"))
+                    continue
             for t in pl.get("tracks", []):
                 src_path = t.get("src_path", "")
                 if not src_path:
@@ -2047,6 +2072,7 @@ class App:
         from .config import delete_all_backups
         delete_all_backups(self.mgr.writer.root, pid)
         self.staging.drop_pid(pid)
+        self._undo_stack.clear()
         self._refresh_playlists_menu()
 
     def _create_restore_point(self, pid: str):
@@ -2075,6 +2101,12 @@ class App:
             return
         playlist = self.mgr.store.playlists.get(pid)
         if not playlist:
+            return
+        if self._playlist_has_pending(pid):
+            messagebox.showinfo(
+                "Pending changes",
+                f"'{playlist['name']}' has staged changes. Sync or undo them "
+                f"before restoring the playlist.")
             return
         label = _format_backup_timestamp(timestamp)
         confirm = messagebox.askyesno(
@@ -2149,11 +2181,16 @@ class App:
             return
 
         self.playlist_tree.insert("", "end", iid=pid, values=("⟳", name))
+        before = set(self.mgr.store.playlists)
 
         def restore():
             return self.mgr.restore_deleted_playlist(pid, timestamp)
 
         def on_done(sources):
+            # The playlist is recreated as playlist_id(name), which differs
+            # from the backup's pid for older or renamed playlists.
+            created = set(self.mgr.store.playlists) - before
+            new_pid = created.pop() if len(created) == 1 else playlist_id(name)
             source_root = Path(self.mgr.config.source_root).resolve()
             missing = []
             for s in sources:
@@ -2161,7 +2198,7 @@ class App:
                 full = _resolve_source_file(src_path, source_root)
                 if full:
                     title, artist = _read_tags_from_file(full)
-                    self.staging.stage_add(pid, str(full), title, artist)
+                    self.staging.stage_add(new_pid, str(full), title, artist)
                 else:
                     missing.append(src_path)
 
@@ -3080,8 +3117,12 @@ class App:
             try:
                 if error:
                     messagebox.showerror("Error", str(error))
-                elif on_done:
-                    on_done(result)
+                else:
+                    # Snapshots from before a structural change would
+                    # re-stage (or drop) changes against the old playlists.
+                    self._undo_stack.clear()
+                    if on_done:
+                        on_done(result)
             finally:
                 if not self._busy():
                     self._set_ui_locked(False)
@@ -3635,6 +3676,10 @@ class App:
             self._load_tracks_sync(pid, gen)
         else:
             self._tracks_loading = True
+            # Rows of the previous playlist must not answer for this one
+            # (Delete / drag use _track_data by row position).
+            self._track_data = []
+            self._removed_data = []
             self.track_tree.insert("", "end", iid="_loading",
                                    values=("", "Loading...", ""), tags=("loading",))
             self._spawn(self._load_tracks_bg, pid, gen)
@@ -3847,18 +3892,10 @@ class App:
             if cached is not None:
                 return cached
 
-            try:
-                import mutagen
-                path = self.mgr.writer.root / folder / copy_name
-                m = mutagen.File(path, easy=True)
-                if m:
-                    title = m.get("title", [""])[0]
-                    artist = m.get("artist", [""])[0]
-                    if title or artist:
-                        self._tag_cache[cache_key] = (title, artist)
-                        return title, artist
-            except Exception:
-                pass
+            title, artist = _read_title_artist(self.mgr.writer.root / folder / copy_name)
+            if title or artist:
+                self._tag_cache[cache_key] = (title, artist)
+                return title, artist
 
         if src_path:
             source_root = Path(self.mgr.config.source_root).resolve()
@@ -3930,6 +3967,8 @@ class App:
                 )
                 if not proceed:
                     if pending_keys:
+                        # The p:N keys of the adds left behind shifted.
+                        self.staging.unstage_reorder(self.current_pid)
                         self._push_undo(f"Remove {len(pending_keys)} pending track(s)", before)
                         self._refresh_tracks()
                         self._update_status()
