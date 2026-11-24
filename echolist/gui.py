@@ -2221,16 +2221,14 @@ class App:
             return
 
         self.playlist_tree.insert("", "end", iid=pid, values=("⟳", name))
-        before = set(self.mgr.store.playlists)
 
         def restore():
             return self.mgr.restore_deleted_playlist(pid, timestamp)
 
-        def on_done(sources):
-            # The playlist is recreated as playlist_id(name), which differs
-            # from the backup's pid for older or renamed playlists.
-            created = set(self.mgr.store.playlists) - before
-            new_pid = created.pop() if len(created) == 1 else playlist_id(name)
+        def on_done(result):
+            # Stage under the recreated playlist's id, which differs from the
+            # backup's pid for older or renamed playlists.
+            new_pid, sources = result
             source_root = Path(self.mgr.config.source_root).resolve()
             missing = []
             for s in sources:

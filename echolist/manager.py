@@ -801,11 +801,14 @@ class PlaylistManager:
             })
         return deleted
 
-    def restore_deleted_playlist(self, pid: str, timestamp: str | None = None) -> list[dict]:
-        """Recreate a deleted playlist from a backup. Returns track source info for staging.
+    def restore_deleted_playlist(self, pid: str, timestamp: str | None = None) -> tuple[str, list[dict]]:
+        """Recreate a deleted playlist from a backup.
 
-        Each returned dict has: {"src_path": str, "src_hash": str}.
-        The caller should stage these as pending adds (same as snapshot restore).
+        Returns ``(new_pid, sources)``. ``new_pid`` is the id of the recreated
+        playlist, which differs from ``pid`` for playlists created by older
+        versions or renamed since; stage against it. Each source dict has
+        {"src_path": str, "src_hash": str}; the caller stages these as
+        pending adds (same as snapshot restore).
         """
         if pid in self.store.playlists:
             raise ValueError(f"playlist '{pid}' already exists")
@@ -822,7 +825,7 @@ class PlaylistManager:
             raise KeyError(f"backup '{timestamp}' not found for playlist '{pid}'")
 
         name = data.get("playlist_name", pid)
-        self.create_playlist(name)
+        new_pid = self.create_playlist(name)
 
         sources = []
         for entry in data.get("tracks", []):
@@ -832,7 +835,7 @@ class PlaylistManager:
                     "src_path": src_path,
                     "src_hash": entry.get("src_hash", ""),
                 })
-        return sources
+        return new_pid, sources
 
     def check_external_import(self) -> bool:
         """Returns True if the Playlists folder exists but has no .echolist marker."""
