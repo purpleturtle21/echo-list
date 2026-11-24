@@ -128,11 +128,41 @@ def load_defaults() -> dict:
     return {}
 
 
-def save_defaults(source: str, dest: str) -> None:
+def save_defaults(source: str, dest: str,
+                  playlist_folder: str = "Playlists") -> None:
+    """Remember the last workspace, including its playlist folder.
+
+    The folder must be stored too: without it the next launch opens
+    ``<dest>/Playlists`` and silently starts a second, empty workspace.
+    """
     _atomic_write_text(DEFAULT_FILE, json.dumps({
         "source": str(Path(source).resolve()),
         "dest": str(Path(dest).resolve()),
+        "playlist_folder": playlist_folder,
     }))
+
+
+def validate_playlist_folder(dest: str | Path, folder: str) -> str:
+    """Return ``folder`` stripped, or raise ValueError if it is unusable.
+
+    The playlist folder is joined onto the destination, so it must be a
+    relative path that stays strictly inside it (no absolute paths, no ``..``).
+    """
+    folder = folder.strip()
+    if not folder:
+        raise ValueError("The playlist folder name is empty.")
+    p = Path(folder)
+    if p.is_absolute() or p.anchor or ".." in p.parts:
+        raise ValueError(
+            f"Playlist folder {folder!r} must be a folder name inside the "
+            f"destination, not an absolute path or a path with '..'.")
+    dest_root = Path(dest).resolve()
+    resolved = (dest_root / p).resolve()
+    if resolved == dest_root or not resolved.is_relative_to(dest_root):
+        raise ValueError(
+            f"Playlist folder {folder!r} resolves outside the destination "
+            f"{dest_root}.")
+    return folder
 
 
 # ── Per-workspace local state (~/.echolist/backups/<wid>/) ──

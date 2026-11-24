@@ -730,38 +730,33 @@ class TestPermanentDelete:
         mgr.release_lock()
 
     def test_delete_also_purges_pending_staging(self, tmp_path):
-        """Permanently deleting a playlist also cleans pending.json references."""
+        """Dropping a deleted playlist's staged changes removes them from
+        pending.json on disk and keeps other playlists' changes."""
+        from echolist.config import pending_file
+        from echolist.gui import StagingState
+
         src = tmp_path / "lib"
         _make_flac(src / "A" / "B" / "01.flac", "A", "Song")
         dest = tmp_path / "card"
         dest.mkdir()
         mgr = PlaylistManager.init(src, dest)
+        try:
+            path = pending_file(mgr.writer.root)
+            staging = StagingState(path)
+            staging.stage_add("doomed", "x.flac", "X", "A")
+            staging.stage_add("keeper", "y.flac", "Y", "B")
+            staging.stage_remove("doomed", 1, "01 - X.flac")
+            staging.set_reorder("doomed", [{"key": "c:1"}])
+            staging.set_reorder("keeper", [{"key": "c:1"}])
 
-        save_backup(mgr.writer.root, "doomed", "t1",
-                    {"playlist_name": "Doomed", "folder": "Doomed", "tracks": [{"v": 1}]})
+            staging.drop_pid("doomed")  # what _permanently_delete_playlist calls
 
-        # Simulate staged adds/removes/reorders for this pid
-        from echolist.gui import StagingState, PENDING_FILE
-        staging = StagingState.__new__(StagingState)
-        staging.pending_adds = [
-            {"pid": "doomed", "src": "x.flac", "title": "X", "artist": "A"},
-            {"pid": "keeper", "src": "y.flac", "title": "Y", "artist": "B"},
-        ]
-        staging.pending_removes = [
-            {"pid": "doomed", "index": 1, "copy_name": "01 - X.flac"},
-        ]
-        staging.pending_reorders = {"doomed": [{"key": "c:1"}]}
-
-        # Purge (same logic as _permanently_delete_playlist)
-        staging.pending_adds = [a for a in staging.pending_adds if a["pid"] != "doomed"]
-        staging.pending_removes = [r for r in staging.pending_removes if r["pid"] != "doomed"]
-        staging.pending_reorders.pop("doomed", None)
-
-        assert len(staging.pending_adds) == 1
-        assert staging.pending_adds[0]["pid"] == "keeper"
-        assert staging.pending_removes == []
-        assert "doomed" not in staging.pending_reorders
-        mgr.release_lock()
+            reloaded = StagingState(path)
+            assert [a["pid"] for a in reloaded.pending_adds] == ["keeper"]
+            assert reloaded.pending_removes == []
+            assert list(reloaded.pending_reorders) == ["keeper"]
+        finally:
+            mgr.release_lock()
 
     def test_workspace_dir_survives_playlist_delete(self, tmp_path):
         """The workspace-level backup dir is not removed when one playlist is deleted."""

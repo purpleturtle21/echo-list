@@ -524,8 +524,8 @@ class TestAppReorder:
         app._track_data.reverse()
         for i, row in enumerate(app._track_data, 1):
             row["index"] = i
+        app._push_undo("Reorder")
         app.staging.set_reorder(app.current_pid, [{"key": row["key"]} for row in app._track_data])
-        app._undo_stack.append({"type": "reorder", "pid": app.current_pid, "desc": "Reorder"})
 
         app._do_undo()
         assert app.current_pid not in app.staging.pending_reorders

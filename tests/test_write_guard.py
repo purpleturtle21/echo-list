@@ -83,11 +83,9 @@ ALLOWED_CALLS = {
     ("journal.py", "SyncJournal.discard"): {"unlink": "remove finished journal (local state)"},
     # ── gui.py: ~/.echolist local state ──
     ("gui.py", "StagingState.clear"): {"unlink": "remove pending.json (local state)"},
+    ("gui.py", "_bind_legacy_staging"): {"unlink": "legacy ~/.echolist/pending.json after migration"},
+    ("gui.py", "App._bind_workspace_state"): {"rename": "set aside an unreadable pending.json"},
     ("gui.py", "_resolve_source_file"): {"replace": "str.replace on a path string"},
-    # Two workspace writes the app still makes directly; they move onto
-    # SafeWriter together with the rest of the app's sync code.
-    ("gui.py", "_cleanup_temp_files"): {"unlink": "leftover _echolist_tmp_* reorder files"},
-    ("gui.py", "App._onload_playlist.on_done"): {"mkdir": "recreate an onloaded playlist folder"},
     # manager.py has no entries: the workspace lock goes through
     # writer.open_lock and the workspace folder through writer.makedirs.
 }
