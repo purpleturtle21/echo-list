@@ -562,10 +562,13 @@ class PlaylistManager:
             "tracks": entries,
         }
 
-        for existing in list_backups(self.writer.root, pid):
-            old = load_backup(self.writer.root, pid, existing["timestamp"])
-            if old and old == new_data:
-                return existing["path"]
+        # Reuse a backup only if it is the newest one: returning an older
+        # identical backup would make a later, different state look current.
+        backups = list_backups(self.writer.root, pid)
+        if backups:
+            newest = load_backup(self.writer.root, pid, backups[0]["timestamp"])
+            if newest == new_data:
+                return backups[0]["path"]
 
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -662,12 +665,25 @@ class PlaylistManager:
     def restore_playlist_to_point(self, pid: str, timestamp: str) -> dict:
         """Restore a playlist to the exact state of a restore point.
 
-        - Tracks in backup but missing from disk → returned in "to_stage" for re-syncing
-        - Tracks on disk but not in backup → deleted
-        - Tracks in both → metadata restored
-        - Renamed tracks (e.g. after reorder) → matched by original_tags, renamed back
+        Each restore-point entry is matched to a current track that holds the
+        same audio: same source hash, else same source path, else same
+        original tags (adopted tracks); a bare file name is trusted only when
+        neither side records any of those. Then:
 
-        Returns {"restored": int, "removed": int, "to_stage": [{"src_path", "src_hash"}]}
+        - matched tracks keep their file, take the restore point's position
+          and get its saved tags back (if it saved any);
+        - entries with no match are returned in "to_stage" with the position
+          ("index", 1-based) they had, for the caller to copy in again;
+        - current tracks the restore point does not have are deleted; a file
+          the card refuses to delete is kept, listed and reported in "failed".
+
+        Positions stay contiguous: tracks are renumbered afterwards, except
+        for a restore point with exact saved tags (an adoption point), whose
+        files get their recorded names back.
+
+        Returns {"restored": int, "removed": int,
+                 "to_stage": [{"src_path", "src_hash", "index"}],
+                 "failed": [str]}
         """
         if pid not in self.store.playlists:
             raise KeyError(f"playlist '{pid}' does not exist")
@@ -682,73 +698,81 @@ class PlaylistManager:
         folder = playlist["folder"]
         folder_path = self.writer.root / folder
 
-        backup_tracks = data.get("tracks", [])
-        backup_names = {t["copy_name"] for t in backup_tracks}
+        backup_tracks = sorted(data.get("tracks", []), key=lambda t: t.get("index", 0))
+        # Only tracks whose file is really there can be kept.
+        unmatched = [t for t in playlist["tracks"] if (folder_path / t["copy_name"]).exists()]
+        matches: dict[int, dict] = {}
+        # Pass 1: same name and not contradicted by identity. Pass 2: identity.
+        for by_name in (True, False):
+            for pos, bt in enumerate(backup_tracks):
+                if pos in matches:
+                    continue
+                for ct in unmatched:
+                    if by_name:
+                        ok = (_name_key(ct["copy_name"]) == _name_key(bt["copy_name"])
+                              and _same_track(bt, ct) is not False)
+                    else:
+                        ok = _same_track(bt, ct) is True
+                    if ok:
+                        matches[pos] = ct
+                        unmatched.remove(ct)
+                        break
 
-        current_by_name = {t["copy_name"]: t for t in playlist["tracks"]}
-        extra_current = {
-            name: t for name, t in current_by_name.items()
-            if name not in backup_names
-        }
-
-        missing_backup = [
-            t for t in backup_tracks
-            if not (folder_path / t["copy_name"]).exists()
-        ]
-
-        # Match renamed files by original_tags before deleting anything
-        rename_map = {}
-        for bt in missing_backup:
-            bt_otags = bt.get("original_tags", {})
-            if not bt_otags:
-                continue
-            for cur_name, ct in list(extra_current.items()):
-                ct_otags = ct.get("original_tags", {})
-                if ct_otags and ct_otags == bt_otags:
-                    rename_map[cur_name] = bt["copy_name"]
-                    del extra_current[cur_name]
-                    break
-
-        for old_name, new_name in rename_map.items():
-            try:
-                self.writer.rename(f"{folder}/{old_name}", f"{folder}/{new_name}")
-            except Exception:
-                pass
-
+        failed: list[str] = []
         removed = 0
-        for name in extra_current:
+        kept_extra = []
+        for ct in unmatched:
             try:
-                self.writer.delete(f"{folder}/{name}")
-            except Exception:
-                pass
+                self.writer.delete(f"{folder}/{ct['copy_name']}")
+            except OSError as e:
+                failed.append(f"{ct['copy_name']}: could not delete ({e.strerror or e})")
+                kept_extra.append(ct)
+                continue
             removed += 1
 
         restored = 0
         to_stage = []
         new_tracks = []
-        for entry in backup_tracks:
-            track_path = folder_path / entry["copy_name"]
-            tags = entry.get("tags")
-            if track_path.exists() and tags:
-                self.writer.edit_in_place(track_path, lambda p, tags=tags: restore_tags(p, tags))
+        exact = False
+        for pos, bt in enumerate(backup_tracks):
+            ct = matches.get(pos)
+            if ct is None:
+                if bt.get("src_path"):
+                    to_stage.append({
+                        "src_path": bt["src_path"],
+                        "src_hash": bt.get("src_hash", ""),
+                        "index": pos + 1,
+                    })
+                else:
+                    failed.append(f"{bt['copy_name']}: missing and has no source to copy from")
+                continue
+            tags = bt.get("tags")
+            if tags:
+                self.writer.edit_in_place(
+                    folder_path / ct["copy_name"], lambda p, tags=tags: restore_tags(p, tags))
                 restored += 1
-                new_tracks.append({
-                    "index": entry["index"],
-                    "src_path": entry.get("src_path", ""),
-                    "copy_name": entry["copy_name"],
-                    "src_hash": entry.get("src_hash", ""),
-                    "original_tags": entry.get("original_tags", {}),
-                })
-            elif entry.get("src_path"):
-                to_stage.append({
-                    "src_path": entry["src_path"],
-                    "src_hash": entry.get("src_hash", ""),
-                })
+                exact = exact or isinstance(tags.get("raw"), dict)
+            ct["src_path"] = bt.get("src_path", ct.get("src_path", ""))
+            ct["src_hash"] = bt.get("src_hash", ct.get("src_hash", ""))
+            if bt.get("original_tags"):
+                ct["original_tags"] = bt["original_tags"]
+            new_tracks.append((ct, bt))
 
-        playlist["tracks"] = new_tracks
-        self.store.save()
+        tracks = [ct for ct, _ in new_tracks] + kept_extra
+        for i, ct in enumerate(tracks, 1):
+            ct["index"] = i
+        playlist["tracks"] = tracks
+        try:
+            if exact and not kept_extra and not to_stage:
+                # An adoption point: give the files their recorded names back.
+                self._move_tracks(folder, [(ct, bt["copy_name"]) for ct, bt in new_tracks])
+            else:
+                self._renumber_tracks(pid)
+        finally:
+            self.store.save()
 
-        return {"restored": restored, "removed": removed, "to_stage": to_stage}
+        return {"restored": restored, "removed": removed,
+                "to_stage": to_stage, "failed": failed}
 
     def list_metadata_backups(self, pid: str) -> list[dict]:
         return list_backups(self.writer.root, pid)
@@ -950,6 +974,17 @@ def _existing_uuid(writer: SafeWriter) -> str:
 def _name_key(name: str) -> str:
     """How FAT32 and macOS compare names: case- and normalization-blind."""
     return unicodedata.normalize("NFC", name).casefold()
+
+
+def _same_track(backup: dict, current: dict) -> bool | None:
+    """Whether a restore-point entry and a current track hold the same audio:
+    True/False from the strongest identity both record (source hash, then
+    source path, then original tags), None when neither records any."""
+    for key in ("src_hash", "src_path", "original_tags"):
+        a, b = backup.get(key), current.get(key)
+        if a and b:
+            return a == b
+    return None
 
 
 def _is_real_audio(p: Path) -> bool:

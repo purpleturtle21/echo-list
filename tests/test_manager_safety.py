@@ -1,7 +1,7 @@
 """PlaylistManager safety on FAT32/macOS: renames never overwrite a name
 that differs only in case or Unicode form, playlists never claim existing or
-internal folders, adds never publish over a file, and removes delete before
-they commit.
+internal folders, adds never publish over a file, removes delete before they
+commit, and restore points match tracks by their audio.
 
 Each test injects the failure at the real I/O boundary (SafeWriter, the
 filesystem) and checks what is on disk and in the reopened Store.
@@ -20,6 +20,7 @@ from mutagen.flac import FLAC
 from conftest import TINY_FLAC, _make_flac
 from echolist.safe_write import SafeWriter
 from echolist.store import Store
+from echolist.config import save_backup, list_backups, load_backup
 
 
 def _key(name: str) -> str:
@@ -295,3 +296,132 @@ def test_expensive_stats_do_not_scan_sibling_volumes(tmp_path, source):
     finally:
         mgr.release_lock()
     assert device_tracks == 1
+
+
+# ── Restore points ──
+
+
+@pytest.fixture
+def lib(manager):
+    lib = Path(manager.config.source_root)
+    _make_flac(lib / "r" / "a.flac", "AA", "A")
+    _make_flac(lib / "r" / "b.flac", "BB", "B")
+    _make_flac(lib / "r" / "c.flac", "CC", "C")
+    _make_flac(lib / "r" / "x1.flac", "First", "X")
+    _make_flac(lib / "r" / "x2.flac", "Second", "X")
+    return lib / "r"
+
+
+def test_restore_rejects_same_name_different_audio(manager, lib):
+    pid = manager.create_playlist("Mix")
+    manager.add_track(pid, lib / "x1.flac")
+    manager.backup_playlist_metadata(pid, "t1")
+    manager.remove_track(pid, 1)
+    manager.add_track(pid, lib / "x2.flac")  # also "01 - X.flac"
+
+    result = manager.restore_playlist_to_point(pid, "t1")
+
+    staged = [s["src_path"] for s in result["to_stage"]]
+    assert staged == ["r/x1.flac"]
+    folder = manager.writer.root / "Mix"
+    for t in manager.store.playlists[pid]["tracks"]:
+        audio_src = FLAC(folder / t["copy_name"])["ECHOLIST_SRC"][0]
+        assert audio_src == t["src_path"]
+
+
+def test_restore_swapped_same_title_tracks(manager, lib):
+    pid = manager.create_playlist("Mix")
+    manager.add_track(pid, lib / "x1.flac")
+    manager.add_track(pid, lib / "x2.flac")
+    manager.backup_playlist_metadata(pid, "t1")
+    folder = manager.writer.root / "Mix"
+    # A completed reorder swapped the two files and their store rows.
+    os.rename(folder / "01 - X.flac", folder / "tmp")
+    os.rename(folder / "02 - X.flac", folder / "01 - X.flac")
+    os.rename(folder / "tmp", folder / "02 - X.flac")
+    t1, t2 = manager.store.playlists[pid]["tracks"]
+    t1["copy_name"], t2["copy_name"] = "02 - X.flac", "01 - X.flac"
+    t1["index"], t2["index"] = 2, 1
+    manager.store.playlists[pid]["tracks"] = [t2, t1]
+    manager.store.save()
+
+    manager.restore_playlist_to_point(pid, "t1")
+
+    # ECHOLIST_SRC is written once at copy time: it identifies the audio.
+    assert FLAC(folder / "01 - X.flac")["ECHOLIST_SRC"][0] == "r/x1.flac"
+    assert FLAC(folder / "02 - X.flac")["ECHOLIST_SRC"][0] == "r/x2.flac"
+    tracks = manager.store.playlists[pid]["tracks"]
+    assert [t["src_path"] for t in tracks] == ["r/x1.flac", "r/x2.flac"]
+
+
+def test_restore_keeps_indices_contiguous_and_positions_missing(manager, lib):
+    pid = manager.create_playlist("Mix")
+    for n in ("a", "b", "c"):
+        manager.add_track(pid, lib / f"{n}.flac")
+    manager.backup_playlist_metadata(pid, "t1")
+    manager.remove_track(pid, 1)
+
+    result = manager.restore_playlist_to_point(pid, "t1")
+
+    tracks = manager.store.playlists[pid]["tracks"]
+    assert [t["index"] for t in tracks] == [1, 2]
+    folder = manager.writer.root / "Mix"
+    for t in tracks:
+        assert t["copy_name"].startswith(f"{t['index']:02d} - ")
+        assert (folder / t["copy_name"]).exists()
+        assert FLAC(folder / t["copy_name"])["TRACKNUMBER"][0] == str(t["index"])
+    assert [(s["src_path"], s["index"]) for s in result["to_stage"]] == [("r/a.flac", 1)]
+
+
+def test_restore_keeps_existing_track_without_saved_tags(manager, lib):
+    pid = manager.create_playlist("Mix")
+    manager.add_track(pid, lib / "a.flac")
+    t = manager.store.playlists[pid]["tracks"][0]
+    save_backup(manager.writer.root, pid, "t1", {
+        "playlist_name": "Mix", "folder": "Mix",
+        "tracks": [{"copy_name": t["copy_name"], "index": 1,
+                    "src_path": t["src_path"], "src_hash": t["src_hash"],
+                    "original_tags": t["original_tags"]}],  # no "tags": file was missing then
+    })
+    result = manager.restore_playlist_to_point(pid, "t1")
+    assert result["to_stage"] == []
+    assert [x["copy_name"] for x in manager.store.playlists[pid]["tracks"]] == [t["copy_name"]]
+
+
+def test_restore_counts_only_real_removals(manager, lib, monkeypatch):
+    pid = manager.create_playlist("Mix")
+    manager.add_track(pid, lib / "a.flac")
+    manager.backup_playlist_metadata(pid, "t1")
+    manager.add_track(pid, lib / "b.flac")
+
+    def deny(self, rel):
+        raise PermissionError(errno.EACCES, "locked", str(rel))
+
+    monkeypatch.setattr(SafeWriter, "delete", deny)
+    result = manager.restore_playlist_to_point(pid, "t1")
+
+    assert result["removed"] == 0
+    assert result["failed"]
+    folder = manager.writer.root / "Mix"
+    names = [t["copy_name"] for t in manager.store.playlists[pid]["tracks"]]
+    assert all((folder / n).exists() for n in names)
+    assert {p.name for p in folder.glob("*.flac")} == set(names)
+
+
+# ── Dedupe never makes an older backup look current ──
+
+
+def test_backup_dedupe_only_against_latest(manager, lib):
+    pid = manager.create_playlist("Mix")
+    manager.add_track(pid, lib / "a.flac")
+    manager.backup_playlist_metadata(pid, "20250101_000001")   # state A
+    manager.add_track(pid, lib / "b.flac")
+    manager.backup_playlist_metadata(pid, "20250101_000002")   # state B
+    manager.remove_track(pid, 2)                                # back to A
+
+    path = manager.backup_playlist_metadata(pid, "20250101_000003")
+
+    newest = list_backups(manager.writer.root, pid)[0]
+    assert newest["path"] == path
+    data = load_backup(manager.writer.root, pid, newest["timestamp"])
+    assert [t["src_path"] for t in data["tracks"]] == ["r/a.flac"]
