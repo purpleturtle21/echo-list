@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import shutil
@@ -30,6 +31,10 @@ from .tags import (
 
 LOCK_REL = ".echolist/workspace.lock"
 
+# errno values meaning "another process holds the lock" (flock / msvcrt).
+_LOCK_BUSY = {e for e in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES,
+                          getattr(errno, "EDEADLK", None)) if e}
+
 
 class WorkspaceLockError(Exception):
     ...
@@ -56,18 +61,23 @@ class PlaylistManager:
         workspace = Path(dest_root).resolve() / playlist_folder
         _check_overlap(source_root, workspace)
         writer = SafeWriter(workspace)
-        config = Config(
-            source_root=str(source_root),
-            node_name=node_name,
-            album_prefix=album_prefix,
-            playlist_folder=playlist_folder,
-            backup_interval=backup_interval,
-            workspace_uuid=_existing_uuid(writer),
-        )
-        store = Store.load(writer)
-        mgr = cls(writer, config, store)
+        mgr = cls(writer, None, None)
+        # Lock first: nothing on the card is read before this instance owns it.
         mgr._acquire_lock()
-        mgr._bind_workspace_state()
+        try:
+            mgr.config = Config(
+                source_root=str(source_root),
+                node_name=node_name,
+                album_prefix=album_prefix,
+                playlist_folder=playlist_folder,
+                backup_interval=backup_interval,
+                workspace_uuid=_existing_uuid(writer),
+            )
+            mgr.store = Store.load(writer)
+            mgr._bind_workspace_state()
+        except BaseException:
+            mgr.release_lock()
+            raise
         return mgr
 
     @classmethod
@@ -75,15 +85,22 @@ class PlaylistManager:
         folder = playlist_folder or DEFAULT_PLAYLIST_FOLDER
         workspace = Path(dest_root).resolve() / folder
         writer = SafeWriter(workspace)
-        config = Config.load(writer)
-        if not config.source_root:
+        if not (writer.root / CONFIG_REL).exists():
             raise ValueError("workspace not initialized — run 'echolist init' first")
-        source_root = Path(config.source_root).resolve()
-        _check_overlap(source_root, workspace)
-        store = Store.load(writer)
-        mgr = cls(writer, config, store)
+        mgr = cls(writer, None, None)
+        # Lock first: another instance may save the Store until it exits.
         mgr._acquire_lock()
-        mgr._bind_workspace_state()
+        try:
+            config = Config.load(writer)
+            if not config.source_root:
+                raise ValueError("workspace not initialized — run 'echolist init' first")
+            _check_overlap(Path(config.source_root).resolve(), workspace)
+            mgr.config = config
+            mgr.store = Store.load(writer)
+            mgr._bind_workspace_state()
+        except BaseException:
+            mgr.release_lock()
+            raise
         return mgr
 
     def _bind_workspace_state(self) -> None:
@@ -95,25 +112,27 @@ class PlaylistManager:
         bind_workspace_state(self.writer.root, self.store.playlists.keys())
 
     def _acquire_lock(self) -> None:
+        # Errors opening the lock file come from the card itself (read-only
+        # switch, I/O error) and propagate as they are; only a lock held by
+        # someone else is "another instance".
+        fd = self.writer.open_lock(LOCK_REL)
         try:
-            fd = self.writer.open_lock(LOCK_REL)
             if os.name == "nt":
                 import msvcrt
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._lock_fd = fd
-        except (OSError, IOError):
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-            raise WorkspaceLockError(
-                "Another EchoList instance is using this workspace. "
-                "Close it first, or delete .echolist/workspace.lock if "
-                "the previous session crashed."
-            )
+        except OSError as e:
+            os.close(fd)
+            if e.errno in _LOCK_BUSY:
+                raise WorkspaceLockError(
+                    "Another EchoList instance is using this workspace. "
+                    "Close it first, or delete .echolist/workspace.lock if "
+                    "the previous session crashed."
+                ) from e
+            raise
+        self._lock_fd = fd
 
     def release_lock(self) -> None:
         if self._lock_fd is not None:
@@ -220,8 +239,12 @@ class PlaylistManager:
         return False
 
     def _ensure_workspace(self) -> None:
+        """Recreate the workspace folder if it vanished (e.g. deleted in
+        Finder). Its lock file went with it, so take the lock again."""
         if not self.writer.root.exists():
             self.writer.makedirs(".")
+            self.release_lock()
+            self._acquire_lock()
             self.config.save(self.writer)
 
     def add_track(self, pid: str, src: str | Path, progress_cb=None) -> str:
