@@ -64,6 +64,9 @@ ALLOWED_CALLS = {
     ("tags.py", "restore_tags"): {"save": "mutagen save on a workspace copy"},
     ("tags.py", "_tag_flac"): {"save": "mutagen save on a workspace copy"},
     ("tags.py", "_tag_easy"): {"save": "mutagen save on a workspace copy"},
+    ("tags.py", "_tag_id3"): {"save": "mutagen save on a workspace copy"},
+    ("tags.py", "_ID3File.save"): {"save": "mutagen save on a workspace copy"},
+    ("tags.py", "_restore_raw"): {"save": "mutagen save on a workspace copy"},
     # ── config.py: ~/.echolist/backups (user-local, not the workspace) ──
     ("config.py", "save_backup"): {"mkdir": "~/.echolist/backups/<wid>/<pid>"},
     ("config.py", "rename_backup_pid"): {

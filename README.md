@@ -131,7 +131,7 @@ It should work with any player that reads metadata from FLAC/MP3/M4A files and b
 No. EchoList only writes to the destination folder. Your source library is read-only.
 
 **What formats are supported?**
-FLAC, MP3, M4A/MP4/AAC. WAV and OGG are not tagged.
+FLAC, MP3, M4A/MP4 (including AAC in an MP4 container), WAV and AIFF are tagged. WAV/AIFF tags are written as an ID3 chunk; whether the Echo Mini shows ID3 tags in WAV files is not yet confirmed on a device. OGG, WMA, DSF/DFF and raw ADTS `.aac` files are copied but not tagged, so they won't group under the playlist in the album/artist browser.
 
 **Can I use this without an Echo Mini?**
 Yes — you can point it at any folder. It's useful for organizing music on SD cards, USB sticks, or any portable player.
