@@ -1,8 +1,16 @@
 """EchoList GUI — dark/red cassette-player theme with staged sync."""
 from __future__ import annotations
 
+import copy
+import errno
+import glob
 import json
+import re
+import sys
+import threading
 import tkinter as tk
+import unicodedata
+import uuid
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from queue import Queue, Empty
@@ -14,10 +22,13 @@ import platform
 import string
 from datetime import datetime
 
-from .manager import PlaylistManager, WorkspaceLockError, AUDIO_EXTS
-from .naming import playlist_id, sanitize
-from .config import load_defaults, save_defaults, DEFAULT_PLAYLIST_FOLDER
-from .journal import SyncJournal
+from .manager import (PlaylistManager, WorkspaceLockError, AUDIO_EXTS, TMP_PREFIX,
+                      _name_key)
+from .naming import (check_playlist_folder_name, pad_width, playlist_id, sanitize,
+                     track_filename)
+from .config import (load_defaults, save_defaults, DEFAULT_PLAYLIST_FOLDER,
+                     journal_file, pending_file, validate_playlist_folder)
+from .journal import INCOMPLETE, SyncJournal
 from .m3u import parse_m3u, curate_playlist_name
 
 M3U_EXTS = frozenset({".m3u", ".m3u8"})
@@ -100,15 +111,31 @@ _HIDDEN_DIRS = frozenset({
 })
 
 
-def _read_tags_from_file(path: Path) -> tuple[str, str]:
+def _read_title_artist(path: Path) -> tuple[str, str]:
+    """Title and artist from a file's tags ("" when absent or unreadable).
+
+    tags.read_playlist_tags reads FLAC, MP3, MP4 and the ID3 chunks of
+    WAV/AIFF (mutagen's easy interface has no title key for those); other
+    formats (OGG, WMA, ...) fall back to mutagen's easy keys.
+    """
+    import mutagen
+    from .tags import read_playlist_tags
+    tags = read_playlist_tags(path)
+    if tags["title"] or tags["artist"]:
+        return tags["title"], tags["artist"]
     try:
-        import mutagen
         m = mutagen.File(path, easy=True)
-        if m:
-            return m.get("title", [""])[0], m.get("artist", [""])[0]
-    except Exception:
-        pass
-    return path.stem, ""
+    except (mutagen.MutagenError, OSError):
+        return "", ""
+    if not m:
+        return "", ""
+    return (m.get("title") or [""])[0], (m.get("artist") or [""])[0]
+
+
+def _read_tags_from_file(path: Path) -> tuple[str, str]:
+    """Title (else the file name) and artist, for display and staging."""
+    title, artist = _read_title_artist(path)
+    return title or path.stem, artist
 
 
 def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
@@ -153,13 +180,70 @@ def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
         search_roots.append(source_root.parent)
     for root in search_roots:
         try:
-            for hit in root.rglob(name):
+            for hit in root.rglob(glob.escape(name)):
                 if hit.is_file():
                     return hit.resolve()
         except OSError:
             pass
 
     return None
+
+
+def _bind_context_menu(widget, handler) -> None:
+    """Right-click: Button-3 on Windows/X11; Aqua Tk sends Button-2 and
+    Control-click instead."""
+    widget.bind("<Button-3>", handler)
+    if platform.system() == "Darwin":
+        widget.bind("<Button-2>", handler)
+        widget.bind("<Control-Button-1>", handler)
+
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+
+_INDEX_PREFIX_RE = re.compile(r"^\d+ - ")
+
+
+def _title_part(copy_name: str) -> str:
+    """A playlist file name without its "NN - " index prefix, in NFC.
+
+    Stable across renumbering (removes, re-padding at 100 tracks) and across
+    the NFC/NFD forms macOS and playlists.json may hold."""
+    return _INDEX_PREFIX_RE.sub("", _nfc(copy_name), count=1)
+
+
+def _same_track(staged: dict, track: dict) -> bool:
+    """Does a staged remove (copy_name, optional src_path) still describe
+    ``track``? Compares stable identity, never the zero-padded index."""
+    name = staged.get("copy_name")
+    if name and _title_part(name) != _title_part(track["copy_name"]):
+        return False
+    src = staged.get("src_path")
+    if src and track.get("src_path") and src != track["src_path"]:
+        return False
+    return True
+
+
+def _is_hidden_source_entry(name: str) -> bool:
+    """Dotfiles (incl. macOS ._* AppleDouble sidecars) and system folders."""
+    return name.startswith(".") or name.lower() in _HIDDEN_DIRS
+
+
+def _walk_source_files(root: Path, exclude: Path | None):
+    """Yield files under ``root``, skipping hidden entries and ``exclude``
+    (the workspace itself, when the library contains the device)."""
+    exclude = exclude.resolve() if exclude else None
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if not _is_hidden_source_entry(d)
+            and (exclude is None or (here / d).resolve() != exclude)
+        )
+        for f in sorted(filenames):
+            if not f.startswith("."):
+                yield here / f
 
 
 def _format_backup_timestamp(ts: str) -> str:
@@ -170,66 +254,165 @@ def _format_backup_timestamp(ts: str) -> str:
         return ts
 
 
-def _cleanup_temp_files(workspace_root: Path) -> None:
-    """Remove _echolist_tmp_* files left by interrupted reorders."""
-    if not workspace_root.exists():
-        return
-    for f in workspace_root.rglob("_echolist_tmp_*"):
-        try:
-            f.unlink()
-        except OSError:
-            pass
-
-
 class StagingState:
-    """Tracks pending add/remove operations before SYNC."""
+    """Tracks pending add/remove/reorder operations before SYNC.
 
-    def __init__(self):
+    One instance per workspace: ``path`` is that workspace's pending.json
+    (config.pending_file). Every mutation saves immediately, and the sync
+    engine unstages each operation only after it succeeded, so pending.json
+    never holds an operation that already ran.
+
+    Keys in a reorder list name rows of the virtual playlist: ``c:N`` is the
+    committed track with index N, ``p:M`` the M-th staged add for that pid.
+    """
+
+    _path: Path | None = None
+    _lock = threading.RLock()
+
+    def __init__(self, path: Path | None = None, load: bool = True):
+        self._path = path
+        self._lock = threading.RLock()
         self.pending_adds: list[dict] = []
         self.pending_removes: list[dict] = []
         self.pending_reorders: dict[str, list] = {}
-        self._load()
+        if load:
+            self._load()
+
+    @property
+    def path(self) -> Path:
+        return self._path or PENDING_FILE
 
     def _load(self):
-        if PENDING_FILE.exists():
-            try:
-                data = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
-                self.pending_adds = data.get("adds", [])
-                self.pending_removes = data.get("removes", [])
-                self.pending_reorders = data.get("reorders", {})
-            except Exception:
-                pass
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            raise StagingLoadError(
+                f"Could not read staged changes from {self.path}: {e}") from e
+        self.pending_adds = data.get("adds", [])
+        self.pending_removes = data.get("removes", [])
+        self.pending_reorders = data.get("reorders", {})
 
     def save(self):
         from .safe_write import atomic_write_text
-        atomic_write_text(PENDING_FILE, json.dumps({
-            "adds": self.pending_adds,
-            "removes": self.pending_removes,
-            "reorders": self.pending_reorders,
-        }, indent=2))
+        with self._lock:
+            atomic_write_text(self.path, json.dumps({
+                "adds": self.pending_adds,
+                "removes": self.pending_removes,
+                "reorders": self.pending_reorders,
+            }, indent=2))
 
     def clear(self):
-        self.pending_adds.clear()
-        self.pending_removes.clear()
-        self.pending_reorders.clear()
-        if PENDING_FILE.exists():
-            PENDING_FILE.unlink()
+        with self._lock:
+            self.pending_adds.clear()
+            self.pending_removes.clear()
+            self.pending_reorders.clear()
+            self.path.unlink(missing_ok=True)
 
     def stage_add(self, pid: str, src: str, title: str, artist: str):
-        self.pending_adds.append({
-            "pid": pid, "src": src, "title": title, "artist": artist,
-        })
-        self.save()
+        with self._lock:
+            self.pending_adds.append({
+                "pid": pid, "src": src, "title": title, "artist": artist,
+            })
+            self.save()
 
-    def stage_remove(self, pid: str, index: int, copy_name: str):
-        self.pending_removes.append({
-            "pid": pid, "index": index, "copy_name": copy_name,
-        })
-        self.save()
+    def stage_remove(self, pid: str, index: int, copy_name: str, src_path: str = ""):
+        entry = {"pid": pid, "index": index, "copy_name": copy_name}
+        if src_path:
+            entry["src_path"] = src_path
+        with self._lock:
+            self.pending_removes.append(entry)
+            self.save()
 
     def set_reorder(self, pid: str, order: list[dict]):
-        self.pending_reorders[pid] = order
-        self.save()
+        with self._lock:
+            self.pending_reorders[pid] = order
+            self.save()
+
+    # ── used by sync / structural playlist changes ──
+
+    def unstage_add(self, entry: dict):
+        with self._lock:
+            self.pending_adds = [a for a in self.pending_adds if a is not entry]
+            self.save()
+
+    def unstage_remove(self, entry: dict):
+        with self._lock:
+            self.pending_removes = [r for r in self.pending_removes if r is not entry]
+            self.save()
+
+    def unstage_reorder(self, pid: str):
+        with self._lock:
+            if self.pending_reorders.pop(pid, None) is not None:
+                self.save()
+
+    def drop_pid(self, pid: str):
+        """Forget every staged change for a playlist that no longer exists."""
+        with self._lock:
+            self.pending_adds = [a for a in self.pending_adds if a["pid"] != pid]
+            self.pending_removes = [r for r in self.pending_removes if r["pid"] != pid]
+            self.pending_reorders.pop(pid, None)
+            self.save()
+
+    def rename_pid(self, old: str, new: str):
+        """Move staged changes along with a renamed playlist."""
+        if old == new:
+            return
+        with self._lock:
+            for entry in self.pending_adds + self.pending_removes:
+                if entry["pid"] == old:
+                    entry["pid"] = new
+            if old in self.pending_reorders:
+                self.pending_reorders[new] = self.pending_reorders.pop(old)
+            self.save()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return copy.deepcopy({
+                "adds": self.pending_adds,
+                "removes": self.pending_removes,
+                "reorders": self.pending_reorders,
+            })
+
+    def restore(self, snap: dict):
+        with self._lock:
+            snap = copy.deepcopy(snap)
+            self.pending_adds = snap["adds"]
+            self.pending_removes = snap["removes"]
+            self.pending_reorders = snap["reorders"]
+            self.save()
+
+    def rebase(self, pid: str, slots: list[str], tracks: list[dict], add_keys: dict):
+        """Re-key the staged changes left for ``pid`` after a partial sync.
+
+        ``slots`` lists, in store order, the pre-sync key of every track now
+        in the playlist (``c:N`` for tracks that were there, ``p:M`` for adds
+        that just landed). ``add_keys`` maps id() of each still-staged add to
+        its pre-sync ``p:M`` key. Afterwards every key/index points at the
+        same track it did before the sync. A remove keeps the identity it was
+        staged with (copy_name / src_path): taking the name of whatever now
+        sits at its index would retarget a rejected remove at another track.
+        """
+        with self._lock:
+            new_key = {k: f"c:{i}" for i, k in enumerate(slots, 1)}
+            remaining = [a for a in self.pending_adds if a["pid"] == pid]
+            for n, a in enumerate(remaining):
+                old = add_keys.get(id(a))
+                if old is not None:
+                    new_key[old] = f"p:{n}"
+            for r in self.pending_removes:
+                if r["pid"] != pid:
+                    continue
+                k = new_key.get(f"c:{r['index']}", "")
+                if k.startswith("c:"):
+                    r["index"] = int(k[2:])
+            if pid in self.pending_reorders:
+                self.pending_reorders[pid] = [
+                    {**e, "key": new_key[e["key"]]}
+                    for e in self.pending_reorders[pid] if e["key"] in new_key
+                ]
+            self.save()
 
     @property
     def has_pending(self) -> bool:
@@ -241,9 +424,12 @@ class StagingState:
 
     def virtual_tracks(self, pid: str, committed_tracks: list[dict]) -> tuple[list[dict], list[dict]]:
         """Returns (active_tracks, removed_tracks)."""
-        removed_indices = {
-            r["index"] for r in self.pending_removes if r["pid"] == pid
-        }
+        with self._lock:
+            removes = list(self.pending_removes)
+            adds = list(self.pending_adds)
+            order = list(self.pending_reorders.get(pid, []))
+            has_order = pid in self.pending_reorders
+        removed_indices = {r["index"] for r in removes if r["pid"] == pid}
         result = []
         removed = []
         for t in committed_tracks:
@@ -253,7 +439,7 @@ class StagingState:
                 result.append({**t, "_pending": False, "_key": f"c:{t['index']}"})
 
         pending_count = 0
-        for a in self.pending_adds:
+        for a in adds:
             if a["pid"] == pid:
                 result.append({
                     "index": 0,
@@ -265,17 +451,13 @@ class StagingState:
                 })
                 pending_count += 1
 
-        if pid in self.pending_reorders:
-            order = self.pending_reorders[pid]
-            by_key = {}
-            for t in result:
-                by_key[t["_key"]] = t
+        if has_order:
+            by_key = {t["_key"]: t for t in result}
             reordered = []
             for entry in order:
                 if entry["key"] in by_key:
                     reordered.append(by_key.pop(entry["key"]))
-            for leftover in by_key.values():
-                reordered.append(leftover)
+            reordered.extend(by_key.values())
             result = reordered
 
         for i, t in enumerate(result, 1):
@@ -286,6 +468,624 @@ class StagingState:
     def virtual_track_count(self, store) -> int:
         committed = sum(len(p["tracks"]) for p in store.playlists.values())
         return committed + len(self.pending_adds) - len(self.pending_removes)
+
+
+def _restore_order(committed: int, staged_at: list) -> list[dict] | None:
+    """Reorder that puts re-staged tracks back at their restore-point
+    positions (1-based, from restore_playlist_to_point's "to_stage").
+
+    The restore keeps the tracks still on the card in restore-point order as
+    c:1..c:N; staged add j (p:j) goes back to position staged_at[j]. Returns
+    None when that is the default order (committed tracks, then the adds).
+    """
+    if not staged_at or any(i is None for i in staged_at):
+        return None
+    order = []
+    c = 1
+    for j, pos in enumerate(staged_at):
+        while len(order) < pos - 1 and c <= committed:
+            order.append({"key": f"c:{c}"})
+            c += 1
+        order.append({"key": f"p:{j}"})
+    order += [{"key": f"c:{i}"} for i in range(c, committed + 1)]
+    default = ([f"c:{i}" for i in range(1, committed + 1)]
+               + [f"p:{j}" for j in range(len(staged_at))])
+    return None if [e["key"] for e in order] == default else order
+
+
+class StagingLoadError(Exception):
+    """pending.json exists but cannot be read; refuse to start with it empty."""
+
+
+def _bind_legacy_staging(staging_path: Path, store) -> None:
+    """Move the old global ~/.echolist/pending.json into this workspace.
+
+    The legacy file has no workspace id, so it is adopted only when every
+    playlist it names exists in this workspace; otherwise it is left alone.
+    """
+    if staging_path.exists() or not PENDING_FILE.exists():
+        return
+    legacy = StagingState(PENDING_FILE)
+    pids = ({a["pid"] for a in legacy.pending_adds}
+            | {r["pid"] for r in legacy.pending_removes}
+            | set(legacy.pending_reorders))
+    if not pids or not pids <= set(store.playlists):
+        return
+    moved = StagingState(staging_path, load=False)
+    moved.restore(legacy.snapshot())
+    PENDING_FILE.unlink()
+
+
+# ── Sync engine ──
+#
+# Removes run first (highest index first, so lower staged indices stay valid),
+# then adds, then reorders. ``slots`` mirrors each touched playlist as a list
+# of pre-sync keys so reorder keys (c:N / p:M) resolve to the tracks they
+# meant, whatever ran before them.
+
+_FATAL_ERRNOS = {e for e in (errno.ENOSPC, errno.EIO, errno.EROFS, errno.ENODEV,
+                             errno.ENXIO, getattr(errno, "EDQUOT", None)) if e}
+
+_TMP_RE = re.compile(r"^" + re.escape(TMP_PREFIX) + r"\d+_(.+)$")
+COPY_PART_GLOB = ".echolist-copy-*.part"
+
+
+class StaleStagingError(Exception):
+    """A staged change no longer matches the playlist on the device."""
+
+
+def _is_fatal(exc: BaseException) -> bool:
+    """Device-level failures: stop writing instead of failing every next op."""
+    return isinstance(exc, OSError) and exc.errno in _FATAL_ERRNOS
+
+
+def _sorted_tracks(playlist: dict) -> list[dict]:
+    return sorted(playlist["tracks"], key=lambda t: t["index"])
+
+
+def run_sync(mgr, staging: StagingState, journal_path: Path | None,
+             progress=None, file_progress=None) -> tuple[list[str], bool]:
+    """Apply every staged change. Returns (errors, journal_closed).
+
+    Each operation is unstaged (and pending.json saved) only after it
+    succeeded; a failed one stays staged with its error reported. Device
+    errors (ENOSPC, EIO, ...) stop the remaining writes, which stay staged.
+    ``journal_closed`` is False only when a reorder could not be completed
+    nor rolled back (or its store save failed) — the journal then stays and
+    is recovered before the next sync or on the next open.
+    """
+    if journal_path is not None:
+        earlier = SyncJournal.load_incomplete(journal_path)
+        if earlier is not None:
+            # Starting over would overwrite the record of a reorder whose
+            # files moved but whose store save failed (it would be shuffled
+            # twice). Finish it first; refuse to sync if that fails.
+            notes, unresolved = recover_interrupted_sync(mgr, staging, earlier)
+            if unresolved:
+                return [f"Sync not started: {n}" for n in notes] or [
+                    "Sync not started: an interrupted sync could not be finished"], False
+            SyncJournal.discard(journal_path)
+
+    with staging._lock:
+        removes = sorted(staging.pending_removes, key=lambda r: r["index"], reverse=True)
+        adds = list(staging.pending_adds)
+        reorders = {pid: list(order) for pid, order in staging.pending_reorders.items()}
+
+    touched = {r["pid"] for r in removes} | {a["pid"] for a in adds} | set(reorders)
+    slots = {}
+    for pid in touched:
+        pl = mgr.store.playlists.get(pid)
+        if pl is not None:
+            slots[pid] = [f"c:{t['index']}" for t in _sorted_tracks(pl)]
+    add_keys = {}
+    counters: dict[str, int] = {}
+    for a in adds:
+        n = counters.get(a["pid"], 0)
+        add_keys[id(a)] = f"p:{n}"
+        counters[a["pid"]] = n + 1
+
+    journal = SyncJournal.begin(removes, adds, reorders, path=journal_path)
+    errors: list[str] = []
+    failed_pids: set[str] = set()
+    aborted = False
+    j = 0
+    done = 0
+
+    def fail(idx, pid, label, exc):
+        nonlocal aborted
+        msg = f"{label}: {exc}"
+        errors.append(msg)
+        journal.mark_failed(idx, msg)
+        failed_pids.add(pid)
+        if _is_fatal(exc):
+            aborted = True
+
+    for r in removes:
+        label = f"Remove {r.get('copy_name') or '#' + str(r['index'])} from {r['pid']}"
+        if aborted:
+            journal.mark_failed(j, "not attempted: sync stopped after a device error")
+        else:
+            pl = mgr.store.playlists.get(r["pid"])
+            if pl is not None:
+                # Lets recovery tell whether this remove ran before a crash.
+                journal.update(j, count_before=len(pl["tracks"]))
+            journal.mark_current(j)
+            done += 1
+            if progress:
+                progress(done, "Removing...")
+            try:
+                _remove_staged(mgr, r, slots)
+            except StaleStagingError as e:
+                # The track it named is gone or replaced: it can never apply.
+                staging.unstage_remove(r)
+                fail(j, r["pid"], label, f"{e} (the removal was unstaged)")
+            except Exception as e:  # reported to the user; the remove stays staged
+                fail(j, r["pid"], label, e)
+            else:
+                staging.unstage_remove(r)
+                journal.mark_done(j)
+        j += 1
+
+    for a in adds:
+        name = Path(a["src"]).name
+        if aborted:
+            journal.mark_failed(j, "not attempted: sync stopped after a device error")
+        else:
+            pl = mgr.store.playlists.get(a["pid"])
+            if pl is not None:
+                # Lets recovery find a copy published before the store save.
+                journal.update(j, count_before=len(pl["tracks"]))
+            journal.mark_current(j)
+            done += 1
+            if progress:
+                progress(done, a.get("title") or name)
+            try:
+                if a["pid"] not in mgr.store.playlists:
+                    raise KeyError(f"playlist '{a['pid']}' does not exist")
+                mgr.add_track(a["pid"], a["src"], progress_cb=file_progress)
+            except Exception as e:  # reported; the add stays staged
+                fail(j, a["pid"], name, e)
+            else:
+                slots[a["pid"]].append(add_keys[id(a)])
+                staging.unstage_add(a)
+                journal.mark_done(j)
+        j += 1
+
+    closed = True
+    for pid, order in reorders.items():
+        if aborted:
+            journal.mark_failed(j, "not attempted: sync stopped after a device error")
+        elif pid not in mgr.store.playlists:
+            fail(j, pid, f"Reorder {pid}", KeyError(f"playlist '{pid}' does not exist"))
+        elif pid in failed_pids:
+            journal.mark_failed(j, "skipped: another change to this playlist failed")
+            errors.append(f"Reorder {pid}: kept staged until its other changes sync")
+        else:
+            journal.mark_current(j)
+            done += 1
+            if progress:
+                progress(done, "Reordering...")
+            try:
+                tag_errors = _apply_reorder(mgr, pid, order, slots[pid], journal, j)
+            except ReorderSaveFailed as e:
+                # Files and the in-memory store are in the new order; only the
+                # save is missing. The kept journal finishes it, so the staged
+                # reorder must not run a second time.
+                errors.append(f"Reorder {pid}: {e}")
+                closed = False
+                slots[pid] = [f"c:{i}" for i in range(1, len(slots[pid]) + 1)]
+                staging.unstage_reorder(pid)
+            except ReorderInterrupted as e:
+                errors.append(f"Reorder {pid}: {e}")
+                closed = False
+            except Exception as e:  # rolled back; the reorder stays staged
+                fail(j, pid, f"Reorder {pid}", e)
+            else:
+                errors.extend(tag_errors)
+                slots[pid] = [f"c:{i}" for i in range(1, len(slots[pid]) + 1)]
+                staging.unstage_reorder(pid)
+                journal.mark_done(j)
+        j += 1
+
+    for pid, pid_slots in slots.items():
+        pl = mgr.store.playlists.get(pid)
+        if pl is not None and len(pid_slots) == len(pl["tracks"]):
+            staging.rebase(pid, pid_slots, _sorted_tracks(pl), add_keys)
+
+    if closed:
+        journal.complete()
+    return errors, closed
+
+
+def _remove_staged(mgr, r: dict, slots: dict) -> None:
+    pid = r["pid"]
+    if pid not in mgr.store.playlists:
+        raise KeyError(f"playlist '{pid}' does not exist")
+    key = f"c:{r['index']}"
+    if key not in slots[pid]:
+        raise StaleStagingError("the track is no longer in the playlist")
+    index = slots[pid].index(key) + 1
+    track = _sorted_tracks(mgr.store.playlists[pid])[index - 1]
+    if not _same_track(r, track):
+        raise StaleStagingError(
+            f"expected {r['copy_name']!r} at #{index} but found "
+            f"{track['copy_name']!r}; the playlist changed since this was "
+            f"staged, so nothing was removed")
+    mgr.remove_track(pid, index)
+    slots[pid].remove(key)
+
+
+class ReorderInterrupted(Exception):
+    """A reorder failed mid-rename and could not be rolled back."""
+
+
+class ReorderSaveFailed(ReorderInterrupted):
+    """Every file was renamed but the store could not be saved."""
+
+
+def _reorder_plan(mgr, pid: str, order: list[dict], slots: list[str]) -> list[dict]:
+    from .manager import _title_from_copy_name
+    playlist = mgr.store.playlists[pid]
+    folder_path = mgr.writer.root / playlist["folder"]
+    tracks = _sorted_tracks(playlist)
+    if len(tracks) != len(slots):
+        raise StaleStagingError("the playlist changed during sync; reorder not applied")
+    wanted = [slots.index(e["key"]) for e in order if e["key"] in slots]
+    wanted += [i for i in range(len(tracks)) if i not in wanted]
+    pad = pad_width(len(tracks))
+    plan = []
+    for new_idx, pos in enumerate(wanted, 1):
+        old_name = tracks[pos]["copy_name"]
+        title = _title_from_copy_name(folder_path / old_name)
+        plan.append({
+            "old": old_name,
+            "tmp": f"{TMP_PREFIX}{new_idx}_{old_name}",
+            "new": track_filename(new_idx, title, Path(old_name).suffix, pad),
+            "index": new_idx,
+        })
+    return plan
+
+
+def _exists(mgr, folder: str, name: str) -> bool:
+    return (mgr.writer.root / folder / name).exists()
+
+
+def _finish_reorder_renames(mgr, folder: str, plan: list[dict], phase: str,
+                            set_phase=None) -> None:
+    """Two-pass rename (old -> tmp -> new), resumable from ``phase``.
+
+    Phase "tmp": files still at their old name have not moved yet. Phase
+    "final": every moving file is at its tmp name or already at its new one.
+    """
+    moving = [p for p in plan if p["old"] != p["new"]]
+    if phase == "tmp":
+        for p in moving:
+            if _exists(mgr, folder, p["tmp"]):
+                continue
+            if not _exists(mgr, folder, p["old"]):
+                raise FileNotFoundError(f"{folder}/{p['old']} is missing")
+            mgr.writer.rename(f"{folder}/{p['old']}", f"{folder}/{p['tmp']}")
+        if set_phase:
+            set_phase("final")
+    for p in moving:
+        if _exists(mgr, folder, p["tmp"]):
+            mgr.writer.rename(f"{folder}/{p['tmp']}", f"{folder}/{p['new']}")
+        elif not _exists(mgr, folder, p["new"]):
+            raise FileNotFoundError(f"{folder}/{p['new']} is missing")
+
+
+def _rollback_reorder_renames(mgr, folder: str, plan: list[dict], phase: str) -> None:
+    """Put every file of a failed reorder back under its old name.
+
+    In phase "tmp" a file at some new name may still be another track's
+    original, so only tmp -> old is undone. In phase "final" every moving file
+    is at its tmp or new name, so new -> tmp is undone first.
+    """
+    moving = [p for p in plan if p["old"] != p["new"]]
+    if phase == "final":
+        for p in moving:
+            if not _exists(mgr, folder, p["tmp"]) and _exists(mgr, folder, p["new"]):
+                mgr.writer.rename(f"{folder}/{p['new']}", f"{folder}/{p['tmp']}")
+    for p in moving:
+        if _exists(mgr, folder, p["tmp"]):
+            mgr.writer.rename(f"{folder}/{p['tmp']}", f"{folder}/{p['old']}")
+
+
+def _commit_reorder(mgr, pid: str, plan: list[dict], token: str | None = None) -> list[str]:
+    """Point the store at the renamed files, save it, then re-tag them.
+
+    ``token`` (from the journal) is written into the playlist with the same
+    save, so a re-run after a crash knows exactly whether the store already
+    holds the new order. Names cannot tell: for a swap of two same-title
+    tracks the old and new name lists are identical. Journals written before
+    the token existed fall back to comparing names.
+    """
+    from .tags import apply_playlist_tags, tags_supported
+    playlist = mgr.store.playlists[pid]
+    folder = playlist["folder"]
+    tracks = _sorted_tracks(playlist)
+    if token is not None:
+        committed = playlist.get("reorder_commit") == token
+    else:
+        committed = [t["copy_name"] for t in tracks] == [p["new"] for p in plan]
+    if committed:
+        new_tracks = tracks
+    else:
+        by_name = {t["copy_name"]: t for t in tracks}
+        new_tracks = []
+        for p in plan:
+            t = by_name.get(p["old"])
+            if t is None:
+                raise StaleStagingError(f"{p['old']} is not in playlist {pid}")
+            new_tracks.append(t)
+        for p, t in zip(plan, new_tracks):
+            t["index"] = p["index"]
+            t["copy_name"] = p["new"]
+        playlist["tracks"] = new_tracks
+    if token is not None:
+        playlist["reorder_commit"] = token
+    mgr.store.save()
+
+    errors = []
+    album = mgr.config.album_prefix + playlist["name"]
+    for t in new_tracks:
+        rel = f"{folder}/{t['copy_name']}"
+        if not tags_supported(mgr.writer.resolve(rel)):
+            continue
+        try:
+            # edit_in_place drops the ._ sidecar macOS re-creates on FAT32.
+            mgr.writer.edit_in_place(rel, lambda p, t=t: apply_playlist_tags(
+                p, mgr.config.node_name, album, t["index"], t.get("src_path", ""), pid))
+        except Exception as e:  # file order is right; "Fix metadata" can retry tags
+            errors.append(f"Tag {t['copy_name']}: {e}")
+    return errors
+
+
+def _apply_reorder(mgr, pid: str, order: list[dict], slots: list[str],
+                   journal: SyncJournal, j: int) -> list[str]:
+    plan = _reorder_plan(mgr, pid, order, slots)
+    folder = mgr.store.playlists[pid]["folder"]
+    phase = ["tmp"]
+
+    def set_phase(ph):
+        phase[0] = ph
+        journal.update(j, phase=ph)
+
+    token = uuid.uuid4().hex
+    journal.update(j, plan=plan, folder=folder, phase="tmp", token=token)
+    try:
+        _finish_reorder_renames(mgr, folder, plan, "tmp", set_phase=set_phase)
+    except Exception as e:
+        try:
+            _rollback_reorder_renames(mgr, folder, plan, phase[0])
+        except Exception as rb:
+            raise ReorderInterrupted(
+                f"{e}; rolling back also failed ({rb}). EchoList will finish "
+                f"this reorder the next time the workspace is opened.") from e
+        raise
+    journal.update(j, phase="commit")
+    try:
+        return _commit_reorder(mgr, pid, plan, token)
+    except OSError as e:
+        raise ReorderSaveFailed(
+            f"the files were reordered but the playlist list could not be "
+            f"saved ({e}). EchoList saves it before the next sync, or when "
+            f"the workspace is next opened.") from e
+
+
+# ── Crash recovery (run when a workspace is opened) ──
+
+def _restore_stranded_temp_files(mgr, skip_folders=frozenset()) -> list[str]:
+    """Rename leftover _echolist_tmp_* files back to their original names.
+
+    They are real tracks parked mid-reorder: never delete them. If the
+    original name is taken, pick a free "(recovered N)" name so rescan
+    adopts the file instead. Folders in ``skip_folders`` belong to a reorder
+    whose journal is kept for another attempt; their files stay parked.
+    """
+    notes = []
+    skip = {(mgr.writer.root / f).resolve() for f in skip_folders}
+    for f in sorted(mgr.writer.root.rglob(TMP_PREFIX + "*")):
+        m = _TMP_RE.match(f.name)
+        if not m or not f.is_file() or f.parent.resolve() in skip:
+            continue
+        target = f.with_name(m.group(1))
+        n = 1
+        while target.exists():
+            stem, ext = Path(m.group(1)).stem, Path(m.group(1)).suffix
+            target = f.with_name(f"{stem} (recovered {n}){ext}")
+            n += 1
+        mgr.writer.rename(f, target)
+        notes.append(f"Restored {f.parent.name}/{target.name}")
+    return notes
+
+
+def _sweep_copy_parts(mgr) -> None:
+    """Delete partial copies stranded by a crash during SafeWriter.copy_in.
+
+    Safe because the workspace lock is held: no other EchoList is copying.
+    """
+    for f in mgr.writer.root.rglob(COPY_PART_GLOB):
+        if f.is_file():
+            mgr.writer.delete(f)
+
+
+def _src_in_playlist(mgr, pid: str, src: str) -> bool:
+    source_root = Path(mgr.config.source_root).resolve()
+    p = Path(src)
+    if not p.is_absolute():
+        p = source_root / p
+    p = p.resolve()
+    for t in mgr.store.playlists[pid]["tracks"]:
+        sp = Path(t.get("src_path", ""))
+        if not t.get("src_path"):
+            continue
+        if not sp.is_absolute():
+            sp = source_root / sp
+        if sp.resolve() == p:
+            return True
+    return False
+
+
+def _adopt_published_add(mgr, a: dict, count_before: int) -> bool:
+    """Attach a crash-interrupted add whose copy was already published.
+
+    add_track publishes the file, then saves the store. A crash between the
+    two leaves a file rescan only knows as an unknown track (no src_path).
+    If the track at the add's position is unknown and carries the name this
+    source gets, it is that copy: record its source instead of copying again.
+    """
+    from .manager import _read_title
+    from .tags import read_playlist_tags
+    tracks = _sorted_tracks(mgr.store.playlists[a["pid"]])
+    if len(tracks) <= count_before:
+        return False
+    t = tracks[count_before]
+    if t.get("src_path"):
+        return False
+    source_root = Path(mgr.config.source_root).resolve()
+    src = Path(a["src"])
+    if not src.is_absolute():
+        src = source_root / src
+    src = src.resolve()
+    if not src.is_file():
+        return False
+    if _title_part(t["copy_name"]) != _nfc(sanitize(_read_title(src)) + src.suffix):
+        return False
+    try:
+        t["src_path"] = src.relative_to(source_root).as_posix()
+    except ValueError:
+        t["src_path"] = src.as_posix()
+    t["original_tags"] = read_playlist_tags(src)
+    mgr.store.save()
+    return True
+
+
+def _reconcile_staged_removes(mgr, staging, actions, notes) -> None:
+    removes = [a for a in actions if a.get("op") == "remove"]
+    for r in list(staging.pending_removes):
+        pl = mgr.store.playlists.get(r["pid"])
+        if pl is None:
+            continue
+        tracks = _sorted_tracks(pl)
+        act = next((a for a in removes if a["pid"] == r["pid"]
+                    and a["index"] == r["index"]
+                    and a.get("copy_name", "") == r.get("copy_name", "")), None)
+        if act is not None and act.get("status") == "in_progress":
+            if "count_before" in act:
+                ran = len(tracks) < act["count_before"]
+            else:
+                ran = not any(_same_track(r, t) for t in tracks)
+            if ran:
+                staging.unstage_remove(r)
+                continue
+        if 0 < r["index"] <= len(tracks) and _same_track(r, tracks[r["index"] - 1]):
+            continue
+        matches = [t for t in tracks if _same_track(r, t)]
+        if len(matches) == 1:
+            r["index"] = matches[0]["index"]
+        else:
+            staging.unstage_remove(r)
+            notes.append(f"A staged removal of {r.get('copy_name') or '#' + str(r['index'])} "
+                         f"from {r['pid']} was dropped: that track is no longer "
+                         f"in the playlist.")
+
+
+def recover_interrupted_sync(mgr, staging: StagingState,
+                             journal: SyncJournal | None) -> tuple[list[str], set[str]]:
+    """Bring the workspace and staging back to a consistent state after a crash.
+
+    1. Finish any reorder whose rename plan was journaled (roll forward,
+       recording each phase); if that fails, roll it back; if that fails too,
+       the reorder is unresolved and its folder is left exactly as it is.
+    2. Rename any other stranded _echolist_tmp_* file back (never delete).
+    3. Rescan playlists, then drop staged ops the crash already applied (and
+       adopt an add whose copy was published before the store save). A staged
+       reorder is dropped only if its playlist changed; a reorder the crash
+       never reached is kept.
+
+    Returns (notes for the user, pids of unresolved reorders). The caller
+    discards the journal only when nothing is unresolved.
+    """
+    notes: list[str] = []
+    finished: set[str] = set()
+    unresolved: set[str] = set()
+    unresolved_folders: set[str] = set()
+    actions = journal.actions if journal else []
+    for idx, a in enumerate(actions):
+        if (a.get("status") not in INCOMPLETE or a.get("op") != "reorder"
+                or not a.get("plan") or a["pid"] not in mgr.store.playlists):
+            continue
+        pid = a["pid"]
+
+        def set_phase(ph, idx=idx):
+            journal.update(idx, phase=ph)
+
+        try:
+            if a.get("phase", "tmp") != "commit":
+                _finish_reorder_renames(mgr, a["folder"], a["plan"],
+                                        a.get("phase", "tmp"), set_phase=set_phase)
+                set_phase("commit")
+            notes.extend(_commit_reorder(mgr, pid, a["plan"], a.get("token")))
+        except (OSError, StaleStagingError) as e:
+            rolled_back = False
+            if a.get("phase", "tmp") != "commit":
+                try:
+                    _rollback_reorder_renames(mgr, a["folder"], a["plan"],
+                                              a.get("phase", "tmp"))
+                    rolled_back = True
+                except OSError as rb:
+                    e = f"{e}; rolling back also failed ({rb})"
+            if rolled_back:
+                journal.mark_failed(idx, f"rolled back on recovery: {e}")
+                notes.append(f"Could not finish reordering {pid} ({e}); the files "
+                             f"were put back in their old order.")
+            else:
+                unresolved.add(pid)
+                unresolved_folders.add(a["folder"])
+                notes.append(f"Could not finish reordering {pid}: {e}. Its files "
+                             f"were left as they are; EchoList tries again before "
+                             f"the next sync and when the workspace is next opened.")
+        else:
+            journal.mark_done(idx)
+            finished.add(pid)
+            notes.append(f"Finished the interrupted reorder of {pid}.")
+    notes.extend(_restore_stranded_temp_files(mgr, unresolved_folders))
+    if journal is None:
+        return notes, unresolved
+
+    changed = {pid for pid in list(mgr.store.playlists)
+               if pid not in unresolved and mgr.rescan_playlist(pid)}
+    # Adds/removes that ran (or may have) shift the keys of a staged reorder.
+    shifted = {a["pid"] for a in actions if a.get("op") in ("add", "remove")
+               and a.get("status") in ("in_progress", "done")}
+    with staging._lock:
+        add_actions = [a for a in actions if a.get("op") == "add"
+                       and a.get("status") == "in_progress" and "count_before" in a]
+        for a in list(staging.pending_adds):
+            if a["pid"] not in mgr.store.playlists:
+                continue
+            if _src_in_playlist(mgr, a["pid"], a["src"]):
+                staging.unstage_add(a)
+                continue
+            act = next((x for x in add_actions
+                        if x["pid"] == a["pid"] and x["src"] == a["src"]), None)
+            if act is not None and _adopt_published_add(mgr, a, act["count_before"]):
+                staging.unstage_add(a)
+                notes.append(f"Kept the copy of {Path(a['src']).name} that the "
+                             f"interrupted sync had already written.")
+        _reconcile_staged_removes(mgr, staging, actions, notes)
+        for pid in list(staging.pending_reorders):
+            if pid in finished:
+                staging.unstage_reorder(pid)
+            elif pid in unresolved:
+                continue
+            elif pid in changed or pid in shifted:
+                staging.unstage_reorder(pid)
+                notes.append(f"The staged reorder of {pid} was dropped: the "
+                             f"playlist changed during the interrupted sync.")
+        staging.save()
+    return notes, unresolved
 
 
 ICON_PATH = Path(__file__).with_name("echolist.ico")
@@ -300,12 +1100,27 @@ class App:
         self._set_icon()
         self._center_window(420, 700)
         self.root.minsize(380, 550)
+        self._init_state()
+        self._poll_callbacks()
+        self._apply_theme()
+        self._show_setup()
+
+    def _init_state(self):
+        """Every attribute the App relies on, before any screen is built.
+
+        Kept separate from __init__ so tests can build an App on a withdrawn
+        root without the setup screen and still get exactly this state.
+        """
         self.mgr = None
         self.source = None
         self.dest = None
         self.current_pid = None
-        self.staging = StagingState()
+        # Bound to a workspace's pending.json in _open_workspace.
+        self.staging = StagingState(load=False)
         self._undo_stack: list[dict] = []
+        # Close was requested while a sync or playlist operation ran: shut
+        # down (releasing the workspace lock) once the last one finishes.
+        self._exit_after_sync = False
         self._sort_col = None
         self._sort_reverse = False
         self._drag_data = None
@@ -314,14 +1129,38 @@ class App:
         self._stats_pending = False
         self._alive = True
         self._syncing = False
+        self._busy_playlists: set[str] = set()
         self._tag_cache: dict[str, tuple[str, str]] = {}
         self._audit_cache: dict[str, list[dict]] = {}
         self._tracks_loading = False
         self._tracks_gen = 0
+        self._track_data: list[dict] = []
+        self._removed_data: list[dict] = []
         self._callback_queue: Queue = Queue()
-        self._poll_callbacks()
-        self._apply_theme()
-        self._show_setup()
+        self._workers: list[Thread] = []
+
+    def _busy(self) -> bool:
+        """A sync or a background playlist operation owns the store/card.
+
+        Every action that changes the store, staging, the card or the
+        workspace checks this first, so only one writer runs at a time.
+        """
+        return self._syncing or bool(self._busy_playlists)
+
+    def _can_rescan(self) -> bool:
+        """Rescans rewrite the store from the files on the card. Not while a
+        worker owns the store, and not while a kept sync journal still has to
+        finish a reorder: its parked files would drop out of the store."""
+        return (not self._busy()
+                and not journal_file(self.mgr.writer.root).exists())
+
+    def _spawn(self, target, *args) -> Thread:
+        """Start a daemon worker thread and remember it (see _workers)."""
+        self._workers = [t for t in self._workers if t.is_alive()]
+        t = Thread(target=target, args=args, daemon=True)
+        self._workers.append(t)
+        t.start()
+        return t
 
     def _invalidate_caches(self, pid: str | None = None):
         """Clear tag and audit caches. If pid given, only that playlist."""
@@ -339,13 +1178,28 @@ class App:
     def _poll_callbacks(self):
         """Drain the callback queue on the main thread (tkinter is not thread-safe on Windows)."""
         try:
-            while True:
+            self._drain_callbacks()
+        finally:
+            if self._alive:
+                self.root.after(16, self._poll_callbacks)
+
+    def _drain_callbacks(self) -> int:
+        """Run every queued callback; returns how many ran.
+
+        A callback that raises goes to Tk's report_callback_exception, like
+        an exception in any other Tk callback, and the rest still run.
+        """
+        ran = 0
+        while True:
+            try:
                 fn = self._callback_queue.get_nowait()
+            except Empty:
+                return ran
+            ran += 1
+            try:
                 fn()
-        except Empty:
-            pass
-        if self._alive:
-            self.root.after(16, self._poll_callbacks)
+            except Exception:
+                self.root.report_callback_exception(*sys.exc_info())
 
     def _schedule_callback(self, fn):
         """Thread-safe way to schedule a function on the main thread."""
@@ -523,10 +1377,15 @@ class App:
     def _open_with_dest(self, dest):
         defaults = load_defaults()
         source = defaults.get("source") or _default_source()
-        self._open_workspace(source, dest)
+        folder = DEFAULT_PLAYLIST_FOLDER
+        if defaults.get("dest") == str(Path(dest).resolve()):
+            folder = defaults.get("playlist_folder") or DEFAULT_PLAYLIST_FOLDER
+        self._open_workspace(source, dest, playlist_folder=folder)
 
     def _show_settings(self):
         """Unified settings screen — used both for initial setup and in-app config."""
+        if self.mgr is not None and self._busy():
+            return
         for w in self.root.winfo_children():
             w.destroy()
         self.root.config(menu=tk.Menu(self.root))
@@ -652,28 +1511,39 @@ class App:
             messagebox.showwarning("Missing paths",
                                     "Both source and destination are required.")
             return
-        folder = self._folder_var.get().strip() or DEFAULT_PLAYLIST_FOLDER
+        try:
+            folder = validate_playlist_folder(
+                dest, self._folder_var.get().strip() or DEFAULT_PLAYLIST_FOLDER)
+        except ValueError as e:
+            messagebox.showerror("Invalid playlist folder", str(e))
+            return
         try:
             interval = max(1, int(self._backup_var.get().strip() or "5"))
         except ValueError:
             interval = 5
 
         if self.mgr:
-            self.mgr.config.backup_interval = interval
-            if folder != self.mgr.config.playlist_folder:
-                self.mgr.config.playlist_folder = folder
-            self.mgr.config.save(self.mgr.writer)
-
-            new_source = source
-            new_dest = dest
-            if new_source != self.source or new_dest != self.dest:
-                self.mgr.release_lock()
-                self._open_workspace(new_source, new_dest,
+            if self._busy():
+                return
+            new_root = (Path(dest) / folder).resolve()
+            if new_root == Path(self.mgr.writer.root).resolve():
+                # Same workspace: only its settings change.
+                self.mgr.config.backup_interval = interval
+                self.mgr.config.source_root = str(Path(source).resolve())
+                try:
+                    self.mgr.config.save(self.mgr.writer)
+                except OSError as e:
+                    messagebox.showerror("Could not save settings", str(e))
+                    return
+                self.source = source
+                save_defaults(source, dest, folder)
+                self._show_main()
+            else:
+                # A different workspace: open it first and keep this one's
+                # lock (and config) untouched until that has succeeded.
+                self._open_workspace(source, dest,
                                      playlist_folder=folder,
                                      backup_interval=interval)
-            else:
-                save_defaults(source, dest)
-                self._show_main()
         else:
             self._open_workspace(source, dest,
                                  playlist_folder=folder,
@@ -683,6 +1553,7 @@ class App:
                         playlist_folder: str = DEFAULT_PLAYLIST_FOLDER,
                         backup_interval: int = 5):
         try:
+            playlist_folder = validate_playlist_folder(dest, playlist_folder)
             playlists_dir = Path(dest) / playlist_folder
             config_file = playlists_dir / ".echolist" / "config.json"
             is_external = playlists_dir.exists() and not config_file.exists()
@@ -703,38 +1574,18 @@ class App:
                     playlist_folder=playlist_folder,
                     backup_interval=backup_interval,
                 )
-            save_defaults(source, dest)
+            save_defaults(source, dest, playlist_folder)
         except WorkspaceLockError as e:
             messagebox.showerror("Workspace locked", str(e))
             return
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
-        self.mgr = mgr
-        self.source = source
-        self.dest = dest
-        self.root.unbind("<Return>")
-
-        incomplete = SyncJournal.load_incomplete()
-        if incomplete:
-            pending = incomplete.pending_actions
-            n = len(pending)
-            messagebox.showwarning(
-                "Interrupted sync detected",
-                f"A previous sync was interrupted with {n} operation(s) "
-                f"remaining.\n\n"
-                f"The workspace may be in a partial state. Use the Playlists "
-                f"menu to restore from a backup, or press Refresh (F5) to "
-                f"rescan from the device.",
-            )
-            SyncJournal.discard()
-            _cleanup_temp_files(mgr.writer.root)
-            for pid in list(mgr.store.playlists):
-                mgr.rescan_playlist(pid)
+        self._adopt_manager(mgr, source, dest)
 
         if is_external and is_empty:
             has_audio = any(
-                f.suffix.lower() in AUDIO_EXTS
+                f.suffix.lower() in AUDIO_EXTS and not f.name.startswith(".")
                 for f in playlists_dir.rglob("*") if f.is_file()
             )
             if has_audio:
@@ -750,6 +1601,80 @@ class App:
                 )
 
         self._show_main()
+
+    def _adopt_manager(self, mgr, source: str, dest: str) -> None:
+        """Switch to an opened (and locked) workspace, then release the old
+        one. The old lock is held until the new workspace is open, so a failed
+        switch leaves the app on the workspace it still owns."""
+        old = self.mgr
+        self.mgr = mgr
+        self.source = source
+        self.dest = dest
+        if old is not None and old is not mgr:
+            old.release_lock()
+        self.root.unbind("<Return>")
+        self._bind_workspace_state(mgr)
+
+    def _bind_workspace_state(self, mgr):
+        """Load this workspace's staged changes and recover from a crash.
+
+        Staging and the sync journal are per workspace (config.pending_file /
+        journal_file), so another card's changes never apply here.
+        """
+        self._undo_stack.clear()
+        path = pending_file(mgr.writer.root)
+        try:
+            _bind_legacy_staging(path, mgr.store)
+        except StagingLoadError as e:
+            messagebox.showwarning(
+                "Old staged changes unreadable",
+                f"{e}\n\nThe file was left where it is and not applied to "
+                f"this workspace.")
+        try:
+            self.staging = StagingState(path)
+        except StagingLoadError as e:
+            aside = path.with_name(f"pending.unreadable-{datetime.now():%Y%m%d_%H%M%S}.json")
+            path.rename(aside)
+            self.staging = StagingState(path)
+            messagebox.showwarning(
+                "Staged changes unreadable",
+                f"{e}\n\nThe file was kept as:\n{aside}\n\nStarting with no staged changes.")
+
+        _sweep_copy_parts(mgr)
+        jpath = journal_file(mgr.writer.root)
+        journal = SyncJournal.load_incomplete(jpath)
+        legacy = SyncJournal.load_incomplete()  # pre-0.3 global journal
+        if legacy is not None:
+            if {a["pid"] for a in legacy.actions} <= set(mgr.store.playlists):
+                if journal is None:
+                    # Move it to this workspace first, so whatever recovery
+                    # records (or leaves unfinished) stays with this card.
+                    journal = SyncJournal(legacy.actions, jpath)
+                    journal.update(0)  # writes the journal to jpath
+                SyncJournal.discard()
+        n = len(journal.pending_actions) if journal is not None else 0
+        notes, unresolved = recover_interrupted_sync(mgr, self.staging, journal)
+        if unresolved:
+            detail = "\n".join(f"- {x}" for x in notes[:15])
+            messagebox.showwarning(
+                "Interrupted sync not finished",
+                f"A previous sync was interrupted and could not be completed "
+                f"now. The record of it was kept; EchoList will try again "
+                f"before the next sync and when this workspace is next "
+                f"opened.\n\n{detail}".rstrip(),
+            )
+        elif journal is not None:
+            SyncJournal.discard(jpath)
+            detail = "\n".join(f"- {x}" for x in notes[:15])
+            messagebox.showwarning(
+                "Interrupted sync recovered",
+                f"A previous sync was interrupted with {n} operation(s) "
+                f"unfinished. The playlists were rescanned from the device "
+                f"and staged changes that had already been applied were "
+                f"cleared; the rest are still staged.\n\n{detail}".rstrip(),
+            )
+        elif notes:
+            messagebox.showwarning("Recovered files", "\n".join(notes[:15]))
 
     def _offer_snapshot_restore(self, snapshot: dict, source: str, dest: str) -> bool:
         """Show restore dialog. Returns True if restore was accepted (and workspace opened)."""
@@ -791,23 +1716,25 @@ class App:
                 playlist_folder=snap_folder,
                 backup_interval=snap_config.get("backup_interval", 5),
             )
-            save_defaults(snap_source, dest)
+            save_defaults(snap_source, dest, snap_folder)
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return False
 
-        self.mgr = mgr
-        self.source = snap_source
-        self.dest = dest
-        self.root.unbind("<Return>")
+        self._adopt_manager(mgr, snap_source, dest)
 
         missing_sources = []
+        refused = []
         source_root = Path(snap_source)
-        for pid, pl in playlists.items():
+        for pl in playlists.values():
+            # create_playlist returns playlist_id(name), which differs from
+            # the snapshot's pid for older or renamed playlists: stage there.
             try:
-                mgr.create_playlist(pl["name"])
-            except ValueError:
-                pass
+                pid = mgr.create_playlist(pl["name"])
+            except ValueError as e:
+                # e.g. the folder is already on the card (adopt it instead)
+                refused.append(f"'{pl['name']}': {e}")
+                continue
             for t in pl.get("tracks", []):
                 src_path = t.get("src_path", "")
                 if not src_path:
@@ -821,6 +1748,11 @@ class App:
 
         self._show_main()
 
+        if refused:
+            messagebox.showwarning(
+                "Some playlists not restored",
+                "These playlists were not restored:\n\n"
+                + "\n".join(f"  - {r}" for r in refused[:10]))
         if missing_sources:
             n = len(missing_sources)
             sample = "\n".join(f"  - {s}" for s in missing_sources[:10])
@@ -935,10 +1867,9 @@ class App:
         self.playlist_tree.tag_configure("pending_pl", foreground=PENDING_FG)
         self.playlist_tree.tag_configure("highlight", foreground=YELLOW)
         self.playlist_tree.bind("<<TreeviewSelect>>", self._on_playlist_select)
-        self.playlist_tree.bind("<Button-3>", self._playlist_context_menu)
+        _bind_context_menu(self.playlist_tree, self._playlist_context_menu)
 
         self._rename_entry = None
-        self._busy_playlists: set[str] = set()
         self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self._spinner_idx = 0
         self._spinner_after_id = None
@@ -984,7 +1915,7 @@ class App:
         self.track_tree.tag_configure("loading", foreground=FG_DIM)
 
         # Right-click context menu on tracks
-        self.track_tree.bind("<Button-3>", self._track_context_menu)
+        _bind_context_menu(self.track_tree, self._track_context_menu)
 
         # Delete/Backspace on track tree removes selected tracks
         self.track_tree.bind("<Delete>", self._remove_track)
@@ -1001,6 +1932,8 @@ class App:
         self._update_status()
         self._refresh_expensive_stats()
         self.root.bind("<Control-z>", lambda e: self._do_undo())
+        if platform.system() == "Darwin":
+            self.root.bind("<Command-z>", lambda e: self._do_undo())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         source_root = Path(self.mgr.config.source_root).resolve()
@@ -1080,7 +2013,7 @@ class App:
         file_menu.add_separator()
         file_menu.add_command(label="Settings...", command=self._show_settings)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.add_command(label="Exit", command=self._on_close)
         self.root.bind("<F5>", lambda e: self._refresh_all())
         menubar.add_cascade(label="File", menu=file_menu)
 
@@ -1154,6 +2087,8 @@ class App:
                 self._playlists_menu.add_cascade(label=f"{name} (deleted)", menu=sub)
 
     def _permanently_delete_playlist(self, pid: str, name: str):
+        if self._busy():
+            return
         confirm = messagebox.askyesno(
             "Permanently delete",
             f"Permanently delete all restore points for '{name}'?\n\n"
@@ -1163,14 +2098,13 @@ class App:
             return
         from .config import delete_all_backups
         delete_all_backups(self.mgr.writer.root, pid)
-        # Purge any leftover staged changes for this pid
-        self.staging.pending_adds = [a for a in self.staging.pending_adds if a["pid"] != pid]
-        self.staging.pending_removes = [r for r in self.staging.pending_removes if r["pid"] != pid]
-        self.staging.pending_reorders.pop(pid, None)
-        self.staging.save()
+        self.staging.drop_pid(pid)
+        self._undo_stack.clear()
         self._refresh_playlists_menu()
 
     def _create_restore_point(self, pid: str):
+        if self._busy():
+            return
         playlist = self.mgr.store.playlists.get(pid)
         if not playlist:
             return
@@ -1190,10 +2124,14 @@ class App:
             )
 
     def _restore_from_point(self, pid: str, timestamp: str):
+        if self._busy():
+            return
         playlist = self.mgr.store.playlists.get(pid)
         if not playlist:
             return
         label = _format_backup_timestamp(timestamp)
+        pending_note = ("\nThe changes staged for this playlist will be discarded.\n"
+                        if self._playlist_has_pending(pid) else "")
         confirm = messagebox.askyesno(
             "Restore to point",
             f"Restore playlist '{playlist['name']}' to '{label}'?\n\n"
@@ -1201,7 +2139,8 @@ class App:
             f"- Tracks added since then will be removed\n"
             f"- Tracks deleted since then will be re-staged for sync\n"
             f"- Metadata will be restored on remaining tracks\n\n"
-            f"A restore point of the current state will be saved first.\n\n"
+            f"A restore point of the current state will be saved first.\n"
+            f"{pending_note}\n"
             f"Continue?",
         )
         if not confirm:
@@ -1212,16 +2151,24 @@ class App:
             return self.mgr.restore_playlist_to_point(pid, timestamp)
 
         def on_done(result):
+            # Staged changes were keyed to the playlist as it was; the restore
+            # rewrote it (the undo stack is cleared by _run_playlist_op).
+            self.staging.drop_pid(pid)
             source_root = Path(self.mgr.config.source_root).resolve()
             missing = []
-            for s in result["to_stage"]:
+            staged_at = []  # restore-point position of each staged add, p:0..
+            for s in sorted(result["to_stage"], key=lambda e: e.get("index", 0)):
                 src_path = s["src_path"]
                 full = _resolve_source_file(src_path, source_root)
                 if full:
                     title, artist = _read_tags_from_file(full)
                     self.staging.stage_add(pid, str(full), title, artist)
+                    staged_at.append(s.get("index"))
                 else:
                     missing.append(src_path)
+            order = _restore_order(len(self.mgr.store.playlists[pid]["tracks"]), staged_at)
+            if order is not None:
+                self.staging.set_reorder(pid, order)
 
             self._invalidate_caches(pid)
             self._refresh_playlists()
@@ -1239,11 +2186,21 @@ class App:
                     parts.append(f"Staged {staged} track(s) for re-syncing.")
             if missing:
                 parts.append(f"{len(missing)} source file(s) could not be found.")
-            messagebox.showinfo("Playlist restored", "\n".join(parts) if parts else "No changes needed.")
+            failed = result.get("failed", [])
+            if failed:
+                listed = "\n".join(f"  - {f}" for f in failed[:10])
+                more = f"\n  ... and {len(failed) - 10} more" if len(failed) > 10 else ""
+                parts.append(f"\nNot restored:\n{listed}{more}")
+                messagebox.showwarning("Playlist partly restored", "\n".join(parts))
+            else:
+                messagebox.showinfo("Playlist restored",
+                                    "\n".join(parts) if parts else "No changes needed.")
 
         self._run_playlist_op(pid, name, restore, on_done)
 
     def _restore_deleted(self, pid: str, timestamp: str):
+        if self._busy():
+            return
         label = _format_backup_timestamp(timestamp)
         from .config import load_backup
         data = load_backup(self.mgr.writer.root, pid, timestamp)
@@ -1268,7 +2225,10 @@ class App:
         def restore():
             return self.mgr.restore_deleted_playlist(pid, timestamp)
 
-        def on_done(sources):
+        def on_done(result):
+            # Stage under the recreated playlist's id, which differs from the
+            # backup's pid for older or renamed playlists.
+            new_pid, sources = result
             source_root = Path(self.mgr.config.source_root).resolve()
             missing = []
             for s in sources:
@@ -1276,7 +2236,7 @@ class App:
                 full = _resolve_source_file(src_path, source_root)
                 if full:
                     title, artist = _read_tags_from_file(full)
-                    self.staging.stage_add(pid, str(full), title, artist)
+                    self.staging.stage_add(new_pid, str(full), title, artist)
                 else:
                     missing.append(src_path)
 
@@ -1309,8 +2269,11 @@ class App:
             entries = sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
         except OSError:
             return
+        workspace = self.mgr.writer.root if self.mgr else None
         for entry in entries:
-            if entry.name.startswith(".") or entry.name.lower() in _HIDDEN_DIRS:
+            if _is_hidden_source_entry(entry.name):
+                continue
+            if workspace is not None and entry.is_dir() and entry.resolve() == workspace:
                 continue
             if entry.is_file() and entry.suffix.lower() not in AUDIO_EXTS | M3U_EXTS:
                 continue
@@ -1376,7 +2339,7 @@ class App:
 
     def _do_source_search(self):
         self._src_search_after_id = None
-        query = self._src_search_var.get().strip().lower()
+        query = _nfc(self._src_search_var.get().strip()).casefold()
         if not query:
             source_root = Path(self.mgr.config.source_root).resolve()
             if source_root.exists():
@@ -1388,9 +2351,9 @@ class App:
         self.source_tree.delete(*self.source_tree.get_children())
         matches = []
         limit = 200
-        for p in source_root.rglob("*"):
-            if p.is_file() and p.suffix.lower() in AUDIO_EXTS | M3U_EXTS:
-                if query in p.name.lower():
+        for p in _walk_source_files(source_root, self.mgr.writer.root):
+            if p.suffix.lower() in AUDIO_EXTS | M3U_EXTS:
+                if query in _nfc(p.name).casefold():
                     matches.append(p)
                     if len(matches) >= limit:
                         break
@@ -1550,6 +2513,8 @@ class App:
     # ── Playlist context menu (offload/onload) ──
 
     def _playlist_context_menu(self, event):
+        if self._busy():
+            return
         iid = self.playlist_tree.identify_row(event.y)
         if not iid or iid.startswith("_imported:"):
             return
@@ -1583,20 +2548,31 @@ class App:
         self._show_popup_menu(menu, event)
 
     def _reindex_playlist(self, pid: str):
+        if self._busy():
+            return
         pl = self.mgr.store.playlists.get(pid)
         if not pl or not pl.get("tracks"):
             return
         order = [{"key": f"c:{t['index']}"} for t in pl["tracks"]]
+        self._push_undo(f"Reindex {pid}")
         self.staging.set_reorder(pid, order)
         self._refresh_playlists()
         self._refresh_tracks()
         self._update_status()
 
     def _offload_playlist(self, pid: str):
+        if self._busy():
+            return
         pl = self.mgr.store.playlists.get(pid)
         if not pl:
             return
         if any(not t.get("src_path") for t in pl.get("tracks", [])):
+            return
+        if self._playlist_has_pending(pid):
+            messagebox.showinfo(
+                "Pending changes",
+                f"'{pl['name']}' has staged changes. Sync or undo them "
+                f"before offloading the playlist.")
             return
         name = pl["name"]
         confirm = messagebox.askyesno(
@@ -1610,17 +2586,28 @@ class App:
             return
 
         def offload():
-            self.mgr.backup_playlist_metadata(pid)
-            folder = pl["folder"]
-            try:
-                self.mgr.writer.delete(folder)
-            except Exception:
-                pass
+            # A missing restore point would make the offload unrecoverable,
+            # so a backup failure aborts before anything is deleted.
+            backup = self.mgr.backup_playlist_metadata(pid)
+            self.mgr.writer.delete(pl["folder"])
+            return backup
+
+        def on_done(backup):
+            saved = {k: pl[k] for k in ("tracks", "offloaded", "offload_backup")
+                     if k in pl}
             pl["tracks"] = []
             pl["offloaded"] = True
-            self.mgr.store.save()
-
-        def on_done(_):
+            if backup is not None:
+                pl["offload_backup"] = Path(backup).stem
+            try:
+                self.mgr.store.save()
+            except OSError as e:
+                pl.pop("offload_backup", None)
+                pl.update(saved)
+                messagebox.showerror(
+                    "Offload incomplete",
+                    f"The tracks were removed from the device, but the "
+                    f"playlist list could not be saved:\n{e}")
             self._invalidate_caches(pid)
             self._refresh_playlists()
             self._refresh_tracks()
@@ -1628,35 +2615,57 @@ class App:
 
         self._run_playlist_op(pid, name, offload, on_done)
 
+    def _offload_backup_timestamp(self, pid: str) -> str | None:
+        """The restore point taken when ``pid`` was offloaded. Offloading
+        records it (backup_playlist_metadata can dedupe to an *older* point);
+        older stores without the record fall back to the newest backup."""
+        from .config import list_backups
+        backups = list_backups(self.mgr.writer.root, pid)
+        recorded = self.mgr.store.playlists.get(pid, {}).get("offload_backup")
+        if recorded and any(b["timestamp"] == recorded for b in backups):
+            return recorded
+        return backups[0]["timestamp"] if backups else None
+
     def _onload_playlist(self, pid: str):
+        if self._busy():
+            return
         pl = self.mgr.store.playlists.get(pid)
         if not pl:
             return
-        from .config import load_backup, list_backups
-        backups = list_backups(self.mgr.writer.root, pid)
-        if not backups:
+        from .config import load_backup
+        timestamp = self._offload_backup_timestamp(pid)
+        if timestamp is None:
             messagebox.showerror("No backup", "No restore point found for this playlist.")
             return
 
         name = pl["name"]
 
         def onload():
-            data = load_backup(self.mgr.writer.root, pid, backups[0]["timestamp"])
+            data = load_backup(self.mgr.writer.root, pid, timestamp)
             if not data:
                 raise ValueError("Could not load backup data")
             return data.get("tracks", [])
 
         def on_done(tracks):
+            # Recreate the folder so sync can write into it
+            try:
+                self.mgr.writer.makedirs(pl["folder"])
+            except OSError as e:
+                messagebox.showerror("Onload failed",
+                                     f"Could not create the playlist folder:\n{e}")
+                return
+            saved = {k: pl[k] for k in ("tracks", "offloaded", "offload_backup")
+                     if k in pl}
             pl["offloaded"] = False
             pl["tracks"] = []
-            self.mgr.store.save()
-
-            # Recreate the folder so sync can write into it
-            folder = pl["folder"]
+            pl.pop("offload_backup", None)
             try:
-                (self.mgr.writer.root / folder).mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
+                self.mgr.store.save()
+            except OSError as e:
+                pl.update(saved)
+                messagebox.showerror("Onload failed",
+                                     f"Could not save the playlist list:\n{e}")
+                return
 
             # Stage all tracks for re-copying from source
             source_root = Path(self.mgr.config.source_root).resolve()
@@ -1761,6 +2770,8 @@ class App:
             pass
 
     def _add_selected_from_source(self, selected=None):
+        if self._busy():
+            return
         if selected is None:
             selected = self.source_tree.selection()
         if not selected:
@@ -1778,11 +2789,10 @@ class App:
                     else:
                         audio_paths.append(p)
                 elif p.is_dir():
-                    audio_paths.extend(sorted(
-                        f for f in p.rglob("*")
-                        if f.is_file() and not f.name.startswith(".")
-                        and f.suffix.lower() in AUDIO_EXTS
-                    ))
+                    audio_paths.extend(
+                        f for f in _walk_source_files(p, self.mgr.writer.root)
+                        if f.suffix.lower() in AUDIO_EXTS
+                    )
 
         for m3u in m3u_files:
             self._import_m3u_file(m3u)
@@ -1796,7 +2806,7 @@ class App:
     # ── Staging operations ──
 
     def _stage_add_files(self, paths: list[Path]):
-        if self._syncing or self._current_playlist_offloaded():
+        if self._busy() or self._current_playlist_offloaded():
             return
         if not self.current_pid:
             messagebox.showinfo("No playlist", "Select or create a playlist first.")
@@ -1815,6 +2825,7 @@ class App:
             if a["pid"] == self.current_pid:
                 existing.add(str(Path(a["src"]).resolve()))
 
+        before = self.staging.snapshot()
         added_indices = []
         skipped = []
         for p in paths:
@@ -1829,11 +2840,8 @@ class App:
 
         if added_indices:
             n = len(added_indices)
-            self._undo_stack.append({
-                "type": "add",
-                "indices": added_indices,
-                "desc": f"Add {n} track{'s' if n != 1 else ''} to {self.current_pid}",
-            })
+            self._push_undo(f"Add {n} track{'s' if n != 1 else ''} to {self.current_pid}",
+                            before)
         if skipped:
             messagebox.showinfo("Duplicates skipped",
                                 f"{len(skipped)} track(s) already in playlist:\n" +
@@ -1842,42 +2850,42 @@ class App:
         self._update_status()
 
     def _stage_remove_track(self, pid: str, index: int, copy_name: str):
-        self.staging.stage_remove(pid, index, copy_name)
-        self._undo_stack.append({
-            "type": "remove",
-            "desc": f"Remove #{index} from {pid}",
-        })
+        if self._busy():
+            return
+        before = self.staging.snapshot()
+        track = next((t for t in self.mgr.store.playlists.get(pid, {}).get("tracks", [])
+                      if t["index"] == index), {})
+        self.staging.stage_remove(pid, index, copy_name, track.get("src_path", ""))
+        self._push_undo(f"Remove #{index} from {pid}", before)
         self._refresh_tracks()
         self._update_status()
 
+    def _push_undo(self, desc: str, before: dict | None = None):
+        """Record the staging state to return to. Call with a snapshot taken
+        *before* the change (or none: snapshot now, before changing)."""
+        self._undo_stack.append({
+            "desc": desc,
+            "staging": before if before is not None else self.staging.snapshot(),
+        })
+
     def _do_undo(self):
-        if not self._undo_stack:
+        if not self._undo_stack or self._busy():
             return
         action = self._undo_stack.pop()
-
-        if action["type"] == "add":
-            for i in sorted(action["indices"], reverse=True):
-                if i < len(self.staging.pending_adds):
-                    self.staging.pending_adds.pop(i)
-            self.staging.save()
-        elif action["type"] == "remove":
-            n = action.get("count", 1)
-            for _ in range(n):
-                if self.staging.pending_removes:
-                    self.staging.pending_removes.pop()
-            self.staging.save()
-        elif action["type"] == "unstage_add":
-            pass  # can't re-add unstaged items
-        elif action["type"] == "reorder":
-            pid = action.get("pid", "")
-            if pid in self.staging.pending_reorders:
-                del self.staging.pending_reorders[pid]
-                self.staging.save()
-
+        self.staging.restore(action["staging"])
+        self._refresh_playlists()
         self._refresh_tracks()
         self._update_status()
 
     def _on_close(self):
+        if self._busy():
+            # Keep the workspace lock until the worker writing the card ends;
+            # the sync / playlist-op finish handler shuts down once idle.
+            self._exit_after_sync = True
+            messagebox.showinfo("Operation in progress",
+                                "EchoList will close when the current "
+                                "operation finishes.")
+            return
         if self.staging and self.staging.has_pending:
             n = self.staging.total_ops
             result = messagebox.askyesnocancel(
@@ -1890,7 +2898,15 @@ class App:
             if result is None:
                 return
             if result:
-                self._do_sync_blocking()
+                errors = self._do_sync_blocking()
+                if errors:
+                    self._refresh_playlists()
+                    self._update_status()
+                    self._show_sync_errors(errors)
+                    return
+        self._shutdown()
+
+    def _shutdown(self):
         self._alive = False
         if self.mgr:
             self.mgr.release_lock()
@@ -1898,6 +2914,20 @@ class App:
         if t:
             t.join(timeout=5)
         self.root.destroy()
+
+    def _on_interrupt(self):
+        """Ctrl+C in the terminal: exit cleanly, after running operations."""
+        if self._busy():
+            self._exit_after_sync = True
+            return
+        self._shutdown()
+
+    def _show_sync_errors(self, errors: list[str]):
+        more = f"\n... and {len(errors) - 15} more" if len(errors) > 15 else ""
+        messagebox.showwarning(
+            "Sync errors",
+            "Some changes could not be synced and are still staged:\n\n"
+            + "\n".join(errors[:15]) + more)
 
     def _backup_before_sync(self):
         """Create a restore point for affected playlists, respecting backup_interval."""
@@ -1913,150 +2943,51 @@ class App:
             affected.add(pid)
         for pid in affected:
             if pid in self.mgr.store.playlists:
-                try:
-                    self.mgr.backup_playlist_metadata(pid)
-                except Exception:
-                    pass
+                self.mgr.backup_playlist_metadata(pid)
         self.mgr.config.increment_sync(self.mgr.writer)
 
-    def _do_sync_blocking(self):
-        """Synchronous sync for use during close."""
-        self._backup_before_sync()
-        removes = sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True)
-        adds = list(self.staging.pending_adds)
-        journal = SyncJournal.begin(removes, adds, self.staging.pending_reorders)
-        idx = 0
-        for r in removes:
-            journal.mark_current(idx)
-            try:
-                self.mgr.remove_track(r["pid"], r["index"])
-            except Exception:
-                pass
-            journal.mark_done(idx)
-            idx += 1
-        for a in adds:
-            journal.mark_current(idx)
-            try:
-                self.mgr.add_track(a["pid"], a["src"])
-            except Exception:
-                pass
-            journal.mark_done(idx)
-            idx += 1
-        self._apply_reorders()
-        for i in range(idx, len(journal.actions)):
-            journal.mark_done(i)
-        journal.complete()
-        self.staging.clear()
+    def _journal_path(self) -> Path:
+        return journal_file(self.mgr.writer.root)
+
+    def _after_sync(self):
+        """Bookkeeping shared by both sync paths, on the main thread."""
+        # Undo snapshots describe the pre-sync playlists; restoring one now
+        # would re-stage changes that already ran.
         self._undo_stack.clear()
+        self._invalidate_caches()
         try:
             self.mgr.save_snapshot()
-        except Exception:
-            pass
+        except OSError:
+            pass  # the snapshot is a convenience backup; the sync itself is done
 
-    def _apply_reorders(self):
-        """Re-tag and rename committed tracks to match the staged reorder."""
-        from .tags import apply_playlist_tags
-        from .naming import track_filename
-        import mutagen
-
-        for pid, order in self.staging.pending_reorders.items():
-            if pid not in self.mgr.store.playlists:
-                continue
-            playlist = self.mgr.store.playlists[pid]
-            folder = playlist["folder"]
-
-            committed_by_key = {}
-            for t in playlist["tracks"]:
-                committed_by_key[f"c:{t['index']}"] = t
-
-            # Build the new order with new indices
-            reorder_plan = []
-            new_idx = 1
-            for entry in order:
-                key = entry["key"]
-                if key in committed_by_key:
-                    t = committed_by_key[key]
-                    old_name = t["copy_name"]
-                    # Read title from the file to build the new name
-                    title = t.get("copy_name", "").split(" - ", 1)[-1].rsplit(".", 1)[0]
-                    try:
-                        m = mutagen.File(self.mgr.writer.root / folder / old_name, easy=True)
-                        if m and "title" in m:
-                            title = m["title"][0]
-                    except Exception:
-                        pass
-                    ext = Path(old_name).suffix
-                    pad = 3 if len(order) > 99 else 2
-                    new_name = track_filename(new_idx, title, ext, pad)
-                    reorder_plan.append((t, new_idx, old_name, new_name))
-                    new_idx += 1
-
-            # Also pick up any tracks not in the reorder list
-            for t in playlist["tracks"]:
-                key = f"c:{t['index']}"
-                if key in committed_by_key and t not in [r[0] for r in reorder_plan]:
-                    old_name = t["copy_name"]
-                    ext = Path(old_name).suffix
-                    title = old_name.split(" - ", 1)[-1].rsplit(".", 1)[0]
-                    pad = 3 if len(order) > 99 else 2
-                    new_name = track_filename(new_idx, title, ext, pad)
-                    reorder_plan.append((t, new_idx, old_name, new_name))
-                    new_idx += 1
-
-            # Two-pass rename to avoid collisions
-            # Pass 1: rename to temporary names
-            temp_names = []
-            for t, idx, old_name, new_name in reorder_plan:
-                if old_name != new_name:
-                    tmp_name = f"_echolist_tmp_{idx}_{old_name}"
-                    old_rel = f"{folder}/{old_name}"
-                    tmp_rel = f"{folder}/{tmp_name}"
-                    try:
-                        self.mgr.writer.rename(old_rel, tmp_rel)
-                    except Exception:
-                        pass
-                    temp_names.append((t, idx, tmp_name, new_name))
-                else:
-                    temp_names.append((t, idx, old_name, new_name))
-
-            # Pass 2: rename from temp to final
-            for t, idx, current_name, new_name in temp_names:
-                if current_name != new_name:
-                    tmp_rel = f"{folder}/{current_name}"
-                    new_rel = f"{folder}/{new_name}"
-                    try:
-                        self.mgr.writer.rename(tmp_rel, new_rel)
-                    except Exception:
-                        pass
-
-            # Update store and re-tag
-            new_tracks = []
-            for t, idx, old_name, new_name in reorder_plan:
-                t["index"] = idx
-                t["copy_name"] = new_name
-                try:
-                    path = self.mgr.writer.resolve(f"{folder}/{new_name}")
-                    album = self.mgr.config.album_prefix + playlist["name"]
-                    apply_playlist_tags(
-                        path, self.mgr.config.node_name, album,
-                        idx, t.get("src_path", ""), pid,
-                    )
-                except Exception:
-                    pass
-                new_tracks.append(t)
-
-            playlist["tracks"] = new_tracks
-            self.mgr.store.save()
+    def _do_sync_blocking(self) -> list[str]:
+        """Synchronous sync for use during close. Returns the errors."""
+        try:
+            self._backup_before_sync()
+        except OSError as e:
+            return [f"Sync not started: could not save the restore point "
+                    f"or sync counter: {e}"]
+        errors, _ = run_sync(self.mgr, self.staging, self._journal_path())
+        self._after_sync()
+        return errors
 
     # ── SYNC ──
 
     def _do_sync(self):
-        if not self.staging.has_pending or self._syncing:
+        if not self.staging.has_pending or self._busy():
+            return
+        try:
+            self._backup_before_sync()
+        except OSError as e:
+            messagebox.showerror(
+                "Sync not started",
+                f"Could not save the restore point or sync counter:\n{e}\n\n"
+                f"Nothing was changed on the device; your changes are still "
+                f"staged.")
             return
 
         self._syncing = True
         self._set_ui_locked(True)
-        self._backup_before_sync()
         total = self.staging.total_ops
 
         # Swap button for progress bars
@@ -2069,58 +3000,23 @@ class App:
         self.sync_file_bar["maximum"] = 100
         self.sync_file_bar["value"] = 0
 
-        adds = list(self.staging.pending_adds)
-        removes = sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True)
-        journal = SyncJournal.begin(removes, adds, self.staging.pending_reorders)
+        def _ui(fn):
+            self._schedule_callback(fn)
+
+        def on_progress(done, label):
+            _ui(lambda: _update_progress(done, label))
+            _ui(lambda: _update_file_progress(0))
+
+        def on_copy_progress(copied, file_total):
+            pct = int(copied / file_total * 100) if file_total else 100
+            _ui(lambda: _update_file_progress(pct))
 
         def worker():
-            done = 0
-            errors = []
-            j_idx = 0
-
-            def _ui(fn):
-                self._schedule_callback(fn)
-
-            for r in removes:
-                journal.mark_current(j_idx)
-                done += 1
-                _ui(lambda d=done: _update_progress(d, "Removing..."))
-                try:
-                    self.mgr.remove_track(r["pid"], r["index"])
-                except Exception as e:
-                    errors.append(f"Remove #{r['index']}: {e}")
-                journal.mark_done(j_idx)
-                j_idx += 1
-
-            for i, a in enumerate(adds):
-                journal.mark_current(j_idx)
-                done += 1
-                title = a.get("title", Path(a["src"]).stem)
-                _ui(lambda d=done, t=title: _update_progress(d, t))
-                _ui(lambda: _update_file_progress(0))
-
-                copy_done = [False]
-
-                def on_copy_progress(copied, file_total):
-                    pct = int(copied / file_total * 100) if file_total else 100
-                    if pct >= 100 and not copy_done[0]:
-                        copy_done[0] = True
-                        _ui(lambda d=done, t=title: _update_progress(d, f"Tagging {t}"))
-                        _ui(lambda: _update_file_progress(0))
-                    else:
-                        _ui(lambda p=pct: _update_file_progress(p))
-
-                try:
-                    self.mgr.add_track(a["pid"], a["src"], progress_cb=on_copy_progress)
-                except Exception as e:
-                    errors.append(f"{Path(a['src']).name}: {e}")
-                journal.mark_done(j_idx)
-                j_idx += 1
-
-            self._apply_reorders()
-            for i in range(j_idx, len(journal.actions)):
-                journal.mark_done(i)
-            journal.complete()
+            try:
+                errors, _ = run_sync(self.mgr, self.staging, self._journal_path(),
+                                     progress=on_progress, file_progress=on_copy_progress)
+            except Exception as e:  # unexpected: report it; unfinished ops stay staged
+                errors = [f"Sync stopped: {e}"]
             self._schedule_callback(lambda: _finish(errors))
 
         def _update_progress(done, label=""):
@@ -2133,9 +3029,7 @@ class App:
         def _finish(errors):
             self._syncing = False
             self._set_ui_locked(False)
-            self.staging.clear()
-            self._undo_stack.clear()
-            self._invalidate_caches()
+            self._after_sync()
             self.sync_progress.pack_forget()
             self.sync_status_lbl.pack_forget()
             self.sync_file_bar.pack_forget()
@@ -2143,30 +3037,28 @@ class App:
             self._refresh_playlists()
             self._update_status()
             self._refresh_expensive_stats()
-            try:
-                self.mgr.save_snapshot()
-            except Exception:
-                pass
             if errors:
-                messagebox.showwarning("Sync errors",
-                                        f"Completed with errors:\n" + "\n".join(errors[:15]))
+                self._show_sync_errors(errors)
             else:
                 self.pending_lbl.config(text="  ✓ Sync complete", fg=GREEN)
                 self.root.after(4000, lambda: self.pending_lbl.config(text="", fg=PENDING_FG))
+            if self._exit_after_sync and not self._busy():
+                self._shutdown()
 
-        Thread(target=worker, daemon=True).start()
+        self._spawn(worker)
 
     # ── Playlists ──
 
     def _refresh_all(self):
         """Reload source tree, playlists, tracks, and stats."""
-        if self._syncing:
+        if self._busy():
             return
         source_root = Path(self.mgr.config.source_root).resolve()
         if source_root.exists():
             self._populate_source_tree(source_root)
-        for pid in list(self.mgr.store.playlists):
-            self.mgr.rescan_playlist(pid)
+        if self._can_rescan():
+            for pid in list(self.mgr.store.playlists):
+                self.mgr.rescan_playlist(pid)
         self._refresh_playlists()
         self._refresh_tracks()
         self._update_status()
@@ -2219,8 +3111,14 @@ class App:
             self._refresh_playlists_menu()
 
     def _run_playlist_op(self, pid: str, display_name: str, operation, on_done=None):
-        """Run a blocking playlist operation in a background thread with spinner."""
+        """Run a blocking playlist operation in a background thread with spinner.
+
+        ``operation`` runs on the worker and should only do file I/O; changes
+        to the Store (and store.save()) belong in ``on_done``, which runs on
+        the Tk thread. Every other writer is refused (``_busy()``) meanwhile.
+        """
         self._busy_playlists.add(pid)
+        self._set_ui_locked(True)
         try:
             self.playlist_tree.item(pid, values=("⟳", f"{display_name} {self._spinner_frames[0]}"),
                                     tags=("busy",))
@@ -2254,12 +3152,22 @@ class App:
                     self.playlist_tree.item(pid, values=(icon, name), tags=tags)
             except Exception:
                 pass
-            if error:
-                messagebox.showerror("Error", str(error))
-            elif on_done:
-                on_done(result)
+            try:
+                if error:
+                    messagebox.showerror("Error", str(error))
+                else:
+                    # Snapshots from before a structural change would
+                    # re-stage (or drop) changes against the old playlists.
+                    self._undo_stack.clear()
+                    if on_done:
+                        on_done(result)
+            finally:
+                if not self._busy():
+                    self._set_ui_locked(False)
+                    if self._exit_after_sync:
+                        self._shutdown()
 
-        Thread(target=worker, daemon=True).start()
+        self._spawn(worker)
 
     def _start_spinner(self):
         if self._spinner_after_id is not None:
@@ -2337,7 +3245,7 @@ class App:
                 return
             self._schedule_callback(lambda: self._apply_audit_result(pid, issues))
 
-        Thread(target=_audit, daemon=True).start()
+        self._spawn(_audit)
 
     def _apply_audit_result(self, pid: str, issues: list[dict]):
         if self.current_pid != pid:
@@ -2391,6 +3299,8 @@ class App:
         self.fix_meta_btn.unbind("<Leave>")
 
     def _fix_metadata_clicked(self):
+        if self._busy():
+            return
         if not self.current_pid:
             return
         issues = self.mgr.audit_playlist_metadata(self.current_pid)
@@ -2442,6 +3352,8 @@ class App:
             self._run_playlist_op(pid, pl["name"], fix, on_done)
 
     def _offer_adopt_playlist(self, info: dict):
+        if self._busy():
+            return
         folder = info["folder"]
         count = info["track_count"]
         folder_path = self.mgr.writer.root / folder
@@ -2485,7 +3397,7 @@ class App:
         self._run_playlist_op(pid, folder, adopt, on_done)
 
     def _create_playlist(self):
-        if self._syncing:
+        if self._busy():
             return
         temp_name = "New Playlist"
         try:
@@ -2515,7 +3427,7 @@ class App:
 
     def _import_m3u_dialog(self):
         """Open a file picker to import .m3u/.m3u8 playlists."""
-        if self._syncing:
+        if self._busy():
             return
         files = filedialog.askopenfilenames(
             title="Import .m3u playlists",
@@ -2529,6 +3441,8 @@ class App:
 
     def _import_m3u_file(self, m3u_path: Path):
         """Parse one .m3u file, create a playlist, and stage found tracks."""
+        if self._busy():
+            return
         source_root = Path(self.mgr.config.source_root).resolve()
         result = parse_m3u(m3u_path, source_root=source_root)
 
@@ -2578,6 +3492,8 @@ class App:
         messagebox.showinfo("Playlist imported", "\n".join(parts))
 
     def _start_inline_rename(self, pid):
+        if self._busy():
+            return
         if pid not in self.mgr.store.playlists:
             return
         self.playlist_tree.update_idletasks()
@@ -2605,35 +3521,7 @@ class App:
             self._rename_entry = None
             if not new_name or new_name == current_name:
                 return
-            new_pid = playlist_id(new_name)
-            if new_pid != pid and new_pid in self.mgr.store.playlists:
-                messagebox.showerror("Error", f"Playlist '{new_name}' already exists.")
-                return
-            pl = self.mgr.store.playlists[pid]
-            old_folder = pl["folder"]
-            new_folder = sanitize(new_name)
-
-            # Rename folder on disk first — abort if it fails
-            if old_folder != new_folder:
-                try:
-                    self.mgr.writer.rename(old_folder, new_folder)
-                except Exception as e:
-                    messagebox.showerror("Rename failed",
-                                         f"Could not rename folder on device:\n{e}")
-                    return
-
-            pl["name"] = new_name
-            pl["folder"] = new_folder
-            if new_pid != pid:
-                from .config import rename_backup_pid
-                self.mgr.store.playlists[new_pid] = pl
-                del self.mgr.store.playlists[pid]
-                self.current_pid = new_pid
-                rename_backup_pid(self.mgr.writer.root, pid, new_pid, new_folder)
-            self._invalidate_caches(new_pid if new_pid != pid else pid)
-            self.mgr.store.save()
-            self._refresh_playlists()
-            self._update_status()
+            self._rename_playlist(pid, new_name)
 
         def cancel(event=None):
             entry.destroy()
@@ -2644,8 +3532,76 @@ class App:
         entry.bind("<FocusOut>", commit)
         self._rename_entry = entry
 
+    def _rename_playlist(self, pid: str, new_name: str) -> bool:
+        """Rename a playlist: folder on the device, store, backups, staging."""
+        if self._busy():
+            return False
+        new_pid = playlist_id(new_name)
+        if new_pid != pid and new_pid in self.mgr.store.playlists:
+            messagebox.showerror("Error", f"Playlist '{new_name}' already exists.")
+            return False
+        pl = self.mgr.store.playlists[pid]
+        old_folder = pl["folder"]
+        new_folder = sanitize(new_name)
+        try:
+            check_playlist_folder_name(new_folder)
+        except ValueError as e:
+            messagebox.showerror("Invalid name", str(e))
+            return False
+        # FAT32 folder names are case-insensitive and macOS treats NFC/NFD
+        # forms as one name (same rule as PlaylistManager.create_playlist);
+        # an older store's pid may not match playlist_id(), so compare
+        # folders, not only pids.
+        for other_pid, other in self.mgr.store.playlists.items():
+            if other_pid != pid and _name_key(other["folder"]) == _name_key(new_folder):
+                messagebox.showerror(
+                    "Error",
+                    f"Playlist folder '{new_folder}' is already used by "
+                    f"playlist '{other['name']}'.")
+                return False
+
+        # Rename folder on disk first — abort if it fails
+        if old_folder != new_folder:
+            try:
+                if _name_key(old_folder) == _name_key(new_folder):
+                    # Case/Unicode-form-only rename: FAT32 (vfat) refuses a
+                    # direct rename.
+                    step = f"{new_folder}.echolist-rename"
+                    self.mgr.writer.rename(old_folder, step)
+                    self.mgr.writer.rename(step, new_folder)
+                else:
+                    self.mgr.writer.rename(old_folder, new_folder)
+            except OSError as e:
+                messagebox.showerror("Rename failed",
+                                     f"Could not rename folder on device:\n{e}")
+                return False
+
+        pl["name"] = new_name
+        pl["folder"] = new_folder
+        if new_pid != pid:
+            self.mgr.store.playlists[new_pid] = pl
+            del self.mgr.store.playlists[pid]
+            if self.current_pid == pid:
+                self.current_pid = new_pid
+        self.mgr.store.save()
+        self.staging.rename_pid(pid, new_pid)
+        # Undo snapshots name the old pid; restoring one would orphan entries.
+        self._undo_stack.clear()
+        from .config import rename_backup_pid
+        try:
+            rename_backup_pid(self.mgr.writer.root, pid, new_pid, new_folder)
+        except (OSError, ValueError) as e:
+            messagebox.showwarning(
+                "Restore points not moved",
+                f"The playlist was renamed, but its restore points could not "
+                f"be moved:\n{e}")
+        self._invalidate_caches()
+        self._refresh_playlists()
+        self._update_status()
+        return True
+
     def _delete_playlist(self):
-        if self._syncing:
+        if self._busy():
             return
         if not self.current_pid:
             return
@@ -2669,18 +3625,27 @@ class App:
         self.current_pid = None
 
         def delete():
-            try:
-                self.mgr.backup_playlist_metadata(pid)
-            except Exception:
-                pass
-            try:
-                self.mgr.writer.delete(pl["folder"])
-            except Exception:
-                pass
-            del self.mgr.store.playlists[pid]
-            self.mgr.store.save()
+            # The restore point is what makes this undoable: if it cannot be
+            # written, nothing is deleted. A folder that is already gone is
+            # fine (writer.delete ignores it); any other error aborts.
+            self.mgr.backup_playlist_metadata(pid)
+            self.mgr.writer.delete(pl["folder"])
 
         def on_done(_result):
+            del self.mgr.store.playlists[pid]
+            try:
+                self.mgr.store.save()
+            except OSError as e:
+                self.mgr.store.playlists[pid] = pl
+                messagebox.showerror(
+                    "Delete incomplete",
+                    f"The playlist folder was removed from the device, but the "
+                    f"playlist list could not be saved:\n{e}")
+                self._refresh_playlists()
+                self._update_status()
+                return
+            self.staging.drop_pid(pid)
+            self._undo_stack.clear()
             self._refresh_playlists()
             self._update_status()
 
@@ -2709,13 +3674,13 @@ class App:
         self.track_tree.delete(*self.track_tree.get_children())
         self._track_data = []
         self._removed_data = []
-        from .config import list_backups, load_backup
-        backups = list_backups(self.mgr.writer.root, pid)
-        if not backups:
+        from .config import load_backup
+        timestamp = self._offload_backup_timestamp(pid)
+        if timestamp is None:
             self.track_tree.insert("", "end", values=("", "(offloaded — no backup found)", ""),
                                    tags=("offloaded_track",))
             return
-        data = load_backup(self.mgr.writer.root, pid, backups[0]["timestamp"])
+        data = load_backup(self.mgr.writer.root, pid, timestamp)
         if not data:
             return
         for entry in data.get("tracks", []):
@@ -2733,6 +3698,11 @@ class App:
             self._removed_data = []
             return
         pid = self.current_pid
+        # Rescan here, on the main thread: it rewrites the store, which must
+        # not happen from the tag-loading thread (or during a sync / a
+        # background playlist operation, which own the store meanwhile).
+        if self._can_rescan():
+            self.mgr.rescan_playlist(pid)
         playlist = self.mgr.store.playlists[pid]
         folder = playlist["folder"]
 
@@ -2751,13 +3721,17 @@ class App:
             self._load_tracks_sync(pid, gen)
         else:
             self._tracks_loading = True
+            # Rows of the previous playlist must not answer for this one
+            # (Delete / drag use _track_data by row position).
+            self._track_data = []
+            self._removed_data = []
             self.track_tree.insert("", "end", iid="_loading",
                                    values=("", "Loading...", ""), tags=("loading",))
-            Thread(target=self._load_tracks_bg, args=(pid, gen), daemon=True).start()
+            self._spawn(self._load_tracks_bg, pid, gen)
 
     def _build_track_data(self, pid: str):
-        """Build track/removed data lists. Called from any thread."""
-        self.mgr.rescan_playlist(pid)
+        """Build track/removed data lists. Called from any thread; read-only
+        on the store (the rescan happens in _refresh_tracks)."""
         playlist = self.mgr.store.playlists.get(pid)
         if not playlist:
             return [], []
@@ -2808,9 +3782,9 @@ class App:
     def _load_tracks_bg(self, pid: str, gen: int):
         try:
             track_data, removed_data = self._build_track_data(pid)
-        except Exception:
+        except BaseException:
             self._tracks_loading = False
-            return
+            raise
         if not self._alive or self._tracks_gen != gen:
             self._tracks_loading = False
             return
@@ -2874,7 +3848,7 @@ class App:
     # ── Track reorder drag ──
 
     def _trk_drag_start(self, event):
-        if self._current_playlist_offloaded():
+        if self._busy() or self._current_playlist_offloaded():
             self._trk_drag_iid = None
             return
         iid = self.track_tree.identify_row(event.y)
@@ -2909,6 +3883,9 @@ class App:
         if not self._trk_drag_iid:
             return
         self._trk_drag_iid = None
+        if self._busy():
+            self._display_tracks()  # undo the drag's visual moves
+            return
 
         # Read new order from tree, rebuild _track_data and save reorder
         all_iids = self.track_tree.get_children()
@@ -2949,13 +3926,8 @@ class App:
 
         # Save reorder to staging
         reorder_list = [{"key": row["key"]} for row in new_order]
+        self._push_undo(f"Reorder tracks in {self.current_pid}")
         self.staging.set_reorder(self.current_pid, reorder_list)
-
-        self._undo_stack.append({
-            "type": "reorder",
-            "pid": self.current_pid,
-            "desc": f"Reorder tracks in {self.current_pid}",
-        })
         self._update_status()
 
     def _read_track_tags(self, folder: str, copy_name: str, src_path: str = "") -> tuple[str, str]:
@@ -2965,18 +3937,10 @@ class App:
             if cached is not None:
                 return cached
 
-            try:
-                import mutagen
-                path = self.mgr.writer.root / folder / copy_name
-                m = mutagen.File(path, easy=True)
-                if m:
-                    title = m.get("title", [""])[0]
-                    artist = m.get("artist", [""])[0]
-                    if title or artist:
-                        self._tag_cache[cache_key] = (title, artist)
-                        return title, artist
-            except Exception:
-                pass
+            title, artist = _read_title_artist(self.mgr.writer.root / folder / copy_name)
+            if title or artist:
+                self._tag_cache[cache_key] = (title, artist)
+                return title, artist
 
         if src_path:
             source_root = Path(self.mgr.config.source_root).resolve()
@@ -2990,7 +3954,7 @@ class App:
         return copy_name or "", ""
 
     def _remove_track(self, event=None):
-        if self._syncing or self._current_playlist_offloaded():
+        if self._busy() or self._current_playlist_offloaded():
             return
         if not self.current_pid:
             return
@@ -2998,6 +3962,7 @@ class App:
         if not selected:
             return
 
+        before = self.staging.snapshot()
         all_iids = self.track_tree.get_children()
         selected_rows = []
         for iid in selected:
@@ -3026,12 +3991,7 @@ class App:
                         indices_to_pop.append(i)
                     count += 1
             for i in sorted(indices_to_pop, reverse=True):
-                self.staging.pending_adds.pop(i)
-            self.staging.save()
-            self._undo_stack.append({
-                "type": "unstage_add",
-                "desc": f"Remove {len(indices_to_pop)} pending track(s)",
-            })
+                self.staging.unstage_add(self.staging.pending_adds[i])
 
         if committed_keys:
             playlist = self.mgr.store.playlists[self.current_pid]
@@ -3051,25 +4011,25 @@ class App:
                     f"Continue?",
                 )
                 if not proceed:
+                    if pending_keys:
+                        # The p:N keys of the adds left behind shifted.
+                        self.staging.unstage_reorder(self.current_pid)
+                        self._push_undo(f"Remove {len(pending_keys)} pending track(s)", before)
+                        self._refresh_tracks()
+                        self._update_status()
                     return
             for k in committed_keys:
                 orig_idx = int(k.split(":")[1])
-                copy_name = ""
-                for t in playlist["tracks"]:
-                    if t["index"] == orig_idx:
-                        copy_name = t["copy_name"]
-                        break
-                self.staging.stage_remove(self.current_pid, orig_idx, copy_name)
-            self._undo_stack.append({
-                "type": "remove",
-                "count": len(committed_keys),
-                "desc": f"Remove {len(committed_keys)} track(s) from {self.current_pid}",
-            })
+                track = next((t for t in playlist["tracks"] if t["index"] == orig_idx), {})
+                self.staging.stage_remove(self.current_pid, orig_idx,
+                                          track.get("copy_name", ""),
+                                          track.get("src_path", ""))
 
-        # Clear reorder for this playlist since indices changed
-        if self.current_pid in self.staging.pending_reorders:
-            del self.staging.pending_reorders[self.current_pid]
-            self.staging.save()
+        # Clear reorder for this playlist since its keys changed
+        self.staging.unstage_reorder(self.current_pid)
+        n = len(selected_rows)
+        self._push_undo(f"Remove {n} track{'s' if n != 1 else ''} from {self.current_pid}",
+                        before)
 
         self._refresh_tracks()
         self._update_status()
@@ -3101,9 +4061,7 @@ class App:
             if self._alive:
                 self._schedule_callback(lambda: self._on_expensive_stats(dt, wb))
 
-        t = Thread(target=worker, daemon=True)
-        t.start()
-        self._stats_thread = t
+        self._stats_thread = self._spawn(worker)
 
     def _on_expensive_stats(self, device_tracks, workspace_bytes):
         self._cached_device_tracks = device_tracks
@@ -3161,8 +4119,11 @@ class App:
 
 
 def run():
-    signal.signal(signal.SIGINT, lambda *_: os._exit(0))
     app = App()
+    # Python runs signal handlers between bytecodes; the 16 ms callback poll
+    # keeps that happening during mainloop. Hand off to the Tk thread so the
+    # lock is released and windows close normally.
+    signal.signal(signal.SIGINT, lambda *_: app._schedule_callback(app._on_interrupt))
     app.run()
 
 

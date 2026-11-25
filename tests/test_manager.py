@@ -587,7 +587,8 @@ def test_restore_deleted_playlist(manager, source):
     del manager.store.playlists[pid]
     manager.store.save()
 
-    sources = manager.restore_deleted_playlist(pid)
+    new_pid, sources = manager.restore_deleted_playlist(pid)
+    assert new_pid == pid
     assert pid in manager.store.playlists
     assert manager.store.playlists[pid]["name"] == "Workout"
     assert len(sources) == 1
@@ -604,7 +605,8 @@ def test_restore_deleted_playlist_stages_for_sync(manager, source):
     del manager.store.playlists[pid]
     manager.store.save()
 
-    sources = manager.restore_deleted_playlist(pid)
+    new_pid, sources = manager.restore_deleted_playlist(pid)
+    assert new_pid == pid
     source_root = Path(manager.config.source_root)
     for s in sources:
         full = source_root / s["src_path"]
@@ -612,6 +614,21 @@ def test_restore_deleted_playlist_stages_for_sync(manager, source):
         manager.add_track(pid, full)
 
     assert len(manager.store.playlists[pid]["tracks"]) == 1
+
+
+def test_restore_deleted_returns_the_recreated_pid(manager, source):
+    """A backup kept under an older id is recreated as playlist_id(name); the caller must learn that id."""
+    pid = manager.create_playlist("Workout")
+    manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
+    manager.store.playlists["legacy-id"] = manager.store.playlists.pop(pid)
+    manager.backup_playlist_metadata("legacy-id")
+    manager.writer.delete("Workout")
+    del manager.store.playlists["legacy-id"]
+    manager.store.save()
+
+    new_pid, sources = manager.restore_deleted_playlist("legacy-id")
+    assert new_pid == "workout" and new_pid in manager.store.playlists
+    assert len(sources) == 1
 
 
 def test_restore_deleted_raises_if_exists(manager, source):

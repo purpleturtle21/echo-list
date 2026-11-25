@@ -1,39 +1,103 @@
 """GUI tests — exercises App logic via tkinter without user interaction."""
 
-import time
+import threading
 import tkinter as tk
+import traceback
 import pytest
 from pathlib import Path
 from unittest.mock import patch
 
-from echolist.gui import App, StagingState, _read_tags_from_file, _resolve_source_file, PENDING_FILE
+import echolist.config as _config
+import echolist.gui as _gui
+import echolist.journal as _journal
+from echolist.gui import App, StagingState, _read_tags_from_file, _resolve_source_file
 from echolist.manager import PlaylistManager
 from conftest import _make_flac, assert_originals_untouched
 
+# How long pump() waits for one worker before failing the test (a hang
+# guard only: workers normally finish long before, and pump never sleeps).
+_WORKER_TIMEOUT = 30
 
-def _flush_bg_ops(app, timeout=10):
-    """Wait for all background playlist ops and track loading to finish."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+
+def pump(app):
+    """Run the App's background work to completion, deterministically.
+
+    Joins every worker thread the App started (App._spawn), then runs the
+    callbacks they queued on the Tk thread, until no worker is alive and the
+    queue is empty. Callbacks can start new workers, hence the loop.
+    """
+    while True:
+        for t in list(app._workers):
+            t.join(_WORKER_TIMEOUT)
+            assert not t.is_alive(), f"worker {t.name} did not finish"
+        ran = app._drain_callbacks()
         app.root.update()
-        busy = app._busy_playlists or getattr(app, "_tracks_loading", False)
-        if not busy:
-            break
-        time.sleep(0.05)
-    app.root.update()
+        if not ran and not any(t.is_alive() for t in app._workers):
+            return
 
 
-def _flush_tracks(app, timeout=5):
-    """Wait for background track loading to complete."""
-    deadline = time.monotonic() + timeout
-    while getattr(app, "_tracks_loading", False) and time.monotonic() < deadline:
-        app.root.update()
-        time.sleep(0.02)
-    app.root.update()
+# Kept for the tests written against the old polling helpers.
+_flush_bg_ops = pump
+_flush_tracks = pump
 
 
 @pytest.fixture
-def gui_env(tmp_path):
+def isolated_home(tmp_path, monkeypatch):
+    """Point every ~/.echolist path at tmp_path, so no test can read or
+    write the user's real defaults, legacy pending.json or legacy journal.
+
+    conftest only redirects BACKUPS_ROOT (which also holds the per-workspace
+    pending.json and journal); the rest are module constants computed from
+    Path.home() at import time, so they are patched here, and HOME is moved
+    too in case anything calls Path.home() later.
+    """
+    home = tmp_path / "home"
+    (home / ".echolist").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(_config, "DEFAULT_FILE", home / ".echolist" / "default.json")
+    monkeypatch.setattr(_config, "BACKUPS_ROOT", home / ".echolist" / "backups")
+    monkeypatch.setattr(_gui, "PENDING_FILE", home / ".echolist" / "pending.json")
+    monkeypatch.setattr(_journal, "JOURNAL_FILE", home / ".echolist" / "sync_journal.json")
+    return home
+
+
+@pytest.fixture
+def callback_errors(monkeypatch):
+    """Exceptions raised in Tk callbacks or worker threads during a test.
+
+    Production code reports them (Tk's report_callback_exception, Python's
+    threading.excepthook) instead of crashing; here they must fail the test.
+    """
+    errors = []
+    monkeypatch.setattr(threading, "excepthook",
+                        lambda args: errors.append(
+                            (args.exc_type, args.exc_value, args.exc_traceback)))
+    return errors
+
+
+def _new_app(errors):
+    """An App on a withdrawn root, with exactly the state App.__init__ sets
+    (App._init_state) and no setup screen."""
+    a = App.__new__(App)
+    a.root = tk.Tk()
+    a.root.withdraw()
+    a.root.report_callback_exception = lambda *exc: errors.append(exc)
+    a._init_state()
+    a._apply_theme()
+    return a
+
+
+def _close_app(a, errors):
+    a._alive = False
+    pump(a)
+    a.root.destroy()
+    if errors:
+        pytest.fail("callback raised:\n" + "\n".join(
+            "".join(traceback.format_exception(*e)) for e in errors))
+
+
+@pytest.fixture
+def gui_env(tmp_path, isolated_home):
     """Set up source files, dest, and manager — no GUI yet."""
     src = tmp_path / "library"
     _make_flac(src / "ArtistA" / "Album1" / "01 Song One.flac", "ArtistA", "Song One")
@@ -42,54 +106,23 @@ def gui_env(tmp_path):
     dest = tmp_path / "card"
     dest.mkdir()
     mgr = PlaylistManager.init(src, dest)
-    yield {"src": src, "dest": dest, "mgr": mgr, "tmp": tmp_path}
+    yield {"src": src, "dest": dest, "mgr": mgr, "tmp": tmp_path, "home": isolated_home}
     mgr.release_lock()
 
 
 @pytest.fixture
-def app(gui_env, monkeypatch):
+def app(gui_env, callback_errors):
     """Create an App instance wired to the test workspace, skip setup screen."""
-    # Prevent pending file from leaking between tests
-    test_pending = gui_env["tmp"] / "pending.json"
-    monkeypatch.setattr("echolist.gui.PENDING_FILE", test_pending)
-
-    a = App.__new__(App)
-    a.root = tk.Tk()
-    a.root.withdraw()
+    a = _new_app(callback_errors)
     a.mgr = gui_env["mgr"]
     a.source = str(gui_env["src"])
     a.dest = str(gui_env["dest"])
-    a.current_pid = None
-    a.staging = StagingState.__new__(StagingState)
-    a.staging.pending_adds = []
-    a.staging.pending_removes = []
-    a.staging.pending_reorders = {}
-    a._undo_stack = []
-    a._sort_col = None
-    a._sort_reverse = False
-    a._drag_data = None
-    a._cached_device_tracks = 0
-    a._cached_workspace_bytes = 0
-    a._stats_pending = False
-    a._alive = True
-    a._syncing = False
-    a._tag_cache = {}
-    a._audit_cache = {}
-    a._tracks_loading = False
-    a._tracks_gen = 0
-    from queue import Queue
-    a._callback_queue = Queue()
-    a._poll_callbacks()
-    a._apply_theme()
+    a._bind_workspace_state(a.mgr)
     a._show_main()
+    pump(a)
 
     yield a
-    a._alive = False
-    t = getattr(a, "_stats_thread", None)
-    if t:
-        t.join(timeout=5)
-    _flush_bg_ops(a, timeout=5)
-    a.root.destroy()
+    _close_app(a, callback_errors)
 
 
 # ── Staging tests ──
@@ -524,8 +557,8 @@ class TestAppReorder:
         app._track_data.reverse()
         for i, row in enumerate(app._track_data, 1):
             row["index"] = i
+        app._push_undo("Reorder")
         app.staging.set_reorder(app.current_pid, [{"key": row["key"]} for row in app._track_data])
-        app._undo_stack.append({"type": "reorder", "pid": app.current_pid, "desc": "Reorder"})
 
         app._do_undo()
         assert app.current_pid not in app.staging.pending_reorders
@@ -635,24 +668,14 @@ class TestPlaylistRename:
     """Test inline rename and its interaction with backups."""
 
     def _do_rename(self, app, old_pid, new_name):
-        """Simulate the commit() logic from _start_inline_rename."""
-        from echolist.naming import playlist_id, sanitize
+        """Rename through the inline-rename entry, the way a user does (this used
+        to re-implement the commit logic inline)."""
+        from echolist.naming import playlist_id
+        from test_gui_sync_safety import _rename_via_entry
+        app.current_pid = old_pid
+        _rename_via_entry(app, old_pid, new_name)
         new_pid = playlist_id(new_name)
-        pl = app.mgr.store.playlists[old_pid]
-        old_folder = pl["folder"]
-        new_folder = sanitize(new_name)
-        if old_folder != new_folder:
-            app.mgr.writer.rename(old_folder, new_folder)
-        pl["name"] = new_name
-        pl["folder"] = new_folder
-        if new_pid != old_pid:
-            from echolist.config import rename_backup_pid
-            app.mgr.store.playlists[new_pid] = pl
-            del app.mgr.store.playlists[old_pid]
-            app.current_pid = new_pid
-            rename_backup_pid(app.mgr.writer.root, old_pid, new_pid, new_folder)
-        app._invalidate_caches(new_pid if new_pid != old_pid else old_pid)
-        app.mgr.store.save()
+        assert new_pid in app.mgr.store.playlists
         return new_pid
 
     def test_rename_changes_folder_and_store(self, app, gui_env):
@@ -764,7 +787,13 @@ class TestPlaylistRename:
 
 class TestAuditCacheInvalidation:
     """Verify that the audit cache is cleared after every metadata mutation,
-    so Fix metadata always reflects the current state."""
+    so Fix metadata always reflects the current state.
+
+    Each test drives the real App action (restore, sync, Fix metadata,
+    rename, offload) instead of calling manager methods and
+    _invalidate_caches() by hand, which could not catch a missing call."""
+
+    STALE = [{"fake": "stale"}]
 
     def _sync_and_prime_cache(self, app, gui_env):
         """Create playlist, sync a track, and prime the audit cache."""
@@ -781,119 +810,97 @@ class TestAuditCacheInvalidation:
         assert issues == []
         return pid
 
+    def _assert_fresh(self, app, pid):
+        """The cache holds nothing for pid, or exactly a fresh audit."""
+        fresh = app.mgr.audit_playlist_metadata(pid)
+        assert app._audit_cache.get(pid, fresh) == fresh
+        return fresh
+
+    def _quiet(self):
+        return patch.multiple("echolist.gui.messagebox",
+                              askyesno=lambda *a, **k: True,
+                              showinfo=lambda *a, **k: None,
+                              showwarning=lambda *a, **k: None)
+
     def test_restore_invalidates_audit_cache(self, app, gui_env):
-        """After restoring metadata from before_echolist, audit cache must be
-        cleared so Fix metadata catches the now-wrong tags."""
+        """After restoring a restore point with other tags, the audit cache
+        must be cleared so Fix metadata catches the now-wrong tags."""
         pid = self._sync_and_prime_cache(app, gui_env)
 
-        # Corrupt tags to simulate "before_echolist" state, then backup
         pl = app.mgr.store.playlists[pid]
         track_path = app.mgr.writer.root / pl["folder"] / pl["tracks"][0]["copy_name"]
         from mutagen.flac import FLAC
         f = FLAC(track_path)
         f["ALBUM"] = "Original Album"
         f.save()
-        app.mgr.backup_playlist_metadata(pid)
-
-        # Fix the tags back so audit cache is "clean"
+        app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
         app.mgr.fix_playlist_metadata(pid)
         app._audit_cache[pid] = []
 
-        # Now restore from the backup (puts back "Original Album")
-        from echolist.config import list_backups
-        backups = list_backups(app.mgr.writer.root, pid)
-        app.mgr.restore_playlist_metadata(pid, backups[0]["timestamp"])
-        app._invalidate_caches(pid)
+        with self._quiet():
+            app._restore_from_point(pid, "20200101_000000")
+            _flush_bg_ops(app)
 
-        # Cache should be cleared
-        assert pid not in app._audit_cache
-        # Fresh audit should detect the mismatch
-        issues = app.mgr.audit_playlist_metadata(pid)
-        album_issues = [i for i in issues if i["field"] == "album"]
-        assert len(album_issues) >= 1
+        issues = self._assert_fresh(app, pid)
+        assert [i for i in issues if i["field"] == "album"]
 
     def test_sync_invalidates_audit_cache(self, app, gui_env):
         """After sync, audit cache must be cleared."""
         pid = self._sync_and_prime_cache(app, gui_env)
-
-        # Add another track and sync
         src2 = gui_env["src"] / "ArtistB" / "Album2" / "03 Song Two.flac"
         app._stage_add_files([src2])
+        app._audit_cache[pid] = self.STALE
 
-        # Manually put stale data in cache
-        app._audit_cache[pid] = [{"fake": "stale"}]
+        app._do_sync()
+        _flush_bg_ops(app)
 
-        app._do_sync_blocking()
-        # _do_sync_blocking doesn't invalidate (only used at close),
-        # but _do_sync does — verify via _invalidate_caches directly
-        app._invalidate_caches()
-        assert pid not in app._audit_cache
+        assert app._audit_cache.get(pid) != self.STALE
+        self._assert_fresh(app, pid)
 
     def test_fix_metadata_invalidates_audit_cache(self, app, gui_env):
         """After fixing metadata, audit cache must be cleared."""
         pid = self._sync_and_prime_cache(app, gui_env)
-
-        # Corrupt tags so audit finds issues
         pl = app.mgr.store.playlists[pid]
         track_path = app.mgr.writer.root / pl["folder"] / pl["tracks"][0]["copy_name"]
         from mutagen.flac import FLAC
         f = FLAC(track_path)
         f["ALBUM"] = "WRONG"
         f.save()
+        app._audit_cache[pid] = self.STALE
 
-        # Invalidate so audit re-runs
-        app._invalidate_caches(pid)
-        issues = app.mgr.audit_playlist_metadata(pid)
-        assert len(issues) > 0
+        app.current_pid = pid
+        with self._quiet():
+            app._fix_metadata_clicked()
+            _flush_bg_ops(app)
 
-        # Fix metadata
-        app.mgr.fix_playlist_metadata(pid)
-        app._invalidate_caches(pid)
-
-        # Cache should be cleared, fresh audit should be clean
-        assert pid not in app._audit_cache
-        assert app.mgr.audit_playlist_metadata(pid) == []
+        assert self._assert_fresh(app, pid) == []
 
     def test_rename_invalidates_audit_cache(self, app, gui_env):
         """After rename, audit cache for the new pid should not have stale data."""
-        from echolist.naming import playlist_id, sanitize
-        from echolist.config import rename_backup_pid
-
+        from echolist.naming import playlist_id
+        from test_gui_sync_safety import _rename_via_entry
         pid = self._sync_and_prime_cache(app, gui_env)
+        new_pid = playlist_id("Renamed Audit")
+        app._audit_cache[new_pid] = self.STALE
 
-        # Rename
-        new_name = "Renamed Audit"
-        new_pid = playlist_id(new_name)
-        new_folder = sanitize(new_name)
-        pl = app.mgr.store.playlists[pid]
-        old_folder = pl["folder"]
-        app.mgr.writer.rename(old_folder, new_folder)
-        pl["name"] = new_name
-        pl["folder"] = new_folder
-        if new_pid != pid:
-            app.mgr.store.playlists[new_pid] = pl
-            del app.mgr.store.playlists[pid]
-            app.current_pid = new_pid
-            rename_backup_pid(app.mgr.writer.root, pid, new_pid, new_folder)
-        app._invalidate_caches(new_pid)
-        app.mgr.store.save()
+        _rename_via_entry(app, pid, "Renamed Audit")
+        _flush_bg_ops(app)
 
-        # Cache should not have stale data for new pid
-        assert new_pid not in app._audit_cache
-        # Audit should flag album mismatch (old name baked into tags)
-        issues = app.mgr.audit_playlist_metadata(new_pid)
-        album_issues = [i for i in issues if i["field"] == "album"]
-        assert len(album_issues) >= 1
+        assert app._audit_cache.get(new_pid) != self.STALE
+        issues = self._assert_fresh(app, new_pid)
+        # The old name is still baked into the album tag.
+        assert [i for i in issues if i["field"] == "album"]
 
     def test_offload_invalidates_audit_cache(self, app, gui_env):
         """Offload should clear audit cache for the playlist."""
         pid = self._sync_and_prime_cache(app, gui_env)
+        app._audit_cache[pid] = self.STALE
 
-        # Put stale data in cache
-        app._audit_cache[pid] = [{"fake": "stale"}]
+        with self._quiet():
+            app._offload_playlist(pid)
+            _flush_bg_ops(app)
 
-        # Simulate offload
-        app._invalidate_caches(pid)
+        assert app.mgr.store.playlists[pid]["offloaded"] is True
         assert pid not in app._audit_cache
 
 
@@ -905,7 +912,7 @@ class TestSourceRoot:
         source_root = Path(app.mgr.config.source_root)
         assert source_root == gui_env["src"].resolve()
 
-    def test_source_mismatch_updates_config(self, gui_env, monkeypatch):
+    def test_source_mismatch_updates_config(self, gui_env, callback_errors):
         """Re-opening workspace from a different source updates config.source_root."""
         src = gui_env["src"]
         dest = gui_env["dest"]
@@ -916,75 +923,24 @@ class TestSourceRoot:
 
         mgr.release_lock()
 
-        test_pending = gui_env["tmp"] / "pending.json"
-        monkeypatch.setattr("echolist.gui.PENDING_FILE", test_pending)
-
-        a = App.__new__(App)
-        a.root = tk.Tk()
-        a.root.withdraw()
-        a.mgr = None
-        a.source = ""
-        a.dest = ""
-        a.current_pid = None
-        a.staging = StagingState.__new__(StagingState)
-        a.staging.pending_adds = []
-        a.staging.pending_removes = []
-        a.staging.pending_reorders = {}
-        a._undo_stack = []
-        a._sort_col = None
-        a._sort_reverse = False
-        a._drag_data = None
-        a._cached_device_tracks = 0
-        a._cached_workspace_bytes = 0
-        a._stats_pending = False
-        a._alive = True
-        a._syncing = False
-        a._apply_theme()
+        a = _new_app(callback_errors)
 
         a._open_workspace(str(new_src), str(dest))
 
         assert a.mgr.config.source_root == str(new_src.resolve())
         assert a.source == str(new_src)
 
-        a._alive = False
-        t = getattr(a, "_stats_thread", None)
-        if t:
-            t.join(timeout=5)
-        _flush_bg_ops(a, timeout=5)
         a.mgr.release_lock()
-        a.root.destroy()
+        _close_app(a, callback_errors)
 
-    def test_source_tree_shows_correct_library(self, gui_env, monkeypatch):
+    def test_source_tree_shows_correct_library(self, gui_env, callback_errors):
         """Source tree displays contents from the configured source_root, not its parent."""
         src = gui_env["src"]
         dest = gui_env["dest"]
         mgr = gui_env["mgr"]
         mgr.release_lock()
 
-        test_pending = gui_env["tmp"] / "pending.json"
-        monkeypatch.setattr("echolist.gui.PENDING_FILE", test_pending)
-
-        a = App.__new__(App)
-        a.root = tk.Tk()
-        a.root.withdraw()
-        a.mgr = None
-        a.source = ""
-        a.dest = ""
-        a.current_pid = None
-        a.staging = StagingState.__new__(StagingState)
-        a.staging.pending_adds = []
-        a.staging.pending_removes = []
-        a.staging.pending_reorders = {}
-        a._undo_stack = []
-        a._sort_col = None
-        a._sort_reverse = False
-        a._drag_data = None
-        a._cached_device_tracks = 0
-        a._cached_workspace_bytes = 0
-        a._stats_pending = False
-        a._alive = True
-        a._syncing = False
-        a._apply_theme()
+        a = _new_app(callback_errors)
 
         a._open_workspace(str(src), str(dest))
 
@@ -994,15 +950,10 @@ class TestSourceRoot:
         assert "ArtistB/" in top_names
         assert "ArtistC/" in top_names
 
-        a._alive = False
-        t = getattr(a, "_stats_thread", None)
-        if t:
-            t.join(timeout=5)
-        _flush_bg_ops(a, timeout=5)
         a.mgr.release_lock()
-        a.root.destroy()
+        _close_app(a, callback_errors)
 
-    def test_source_mismatch_persists_to_disk(self, gui_env, monkeypatch):
+    def test_source_mismatch_persists_to_disk(self, gui_env, callback_errors):
         """After source mismatch correction, the new source is persisted in config.json."""
         src = gui_env["src"]
         dest = gui_env["dest"]
@@ -1013,40 +964,12 @@ class TestSourceRoot:
 
         mgr.release_lock()
 
-        test_pending = gui_env["tmp"] / "pending.json"
-        monkeypatch.setattr("echolist.gui.PENDING_FILE", test_pending)
-
-        a = App.__new__(App)
-        a.root = tk.Tk()
-        a.root.withdraw()
-        a.mgr = None
-        a.source = ""
-        a.dest = ""
-        a.current_pid = None
-        a.staging = StagingState.__new__(StagingState)
-        a.staging.pending_adds = []
-        a.staging.pending_removes = []
-        a.staging.pending_reorders = {}
-        a._undo_stack = []
-        a._sort_col = None
-        a._sort_reverse = False
-        a._drag_data = None
-        a._cached_device_tracks = 0
-        a._cached_workspace_bytes = 0
-        a._stats_pending = False
-        a._alive = True
-        a._syncing = False
-        a._apply_theme()
+        a = _new_app(callback_errors)
 
         a._open_workspace(str(new_src), str(dest))
 
         a.mgr.release_lock()
-        a._alive = False
-        t = getattr(a, "_stats_thread", None)
-        if t:
-            t.join(timeout=5)
-        _flush_bg_ops(a, timeout=5)
-        a.root.destroy()
+        _close_app(a, callback_errors)
 
         import json
         config_path = dest / "Playlists" / ".echolist" / "config.json"
@@ -1157,33 +1080,11 @@ class TestOffloadOnload:
         assert not folder_path.exists()
 
     def _do_onload(self, app, pid):
-        """Simulate onload logic inline (avoids threading complexity in tests)."""
-        from echolist.config import load_backup, list_backups
-        from echolist.gui import _resolve_source_file, _read_tags_from_file
-
-        backups = list_backups(app.mgr.writer.root, pid)
-        assert len(backups) >= 1
-        data = load_backup(app.mgr.writer.root, pid, backups[0]["timestamp"])
-        assert data is not None
-
-        pl = app.mgr.store.playlists[pid]
-        pl["offloaded"] = False
-        pl["tracks"] = []
-        app.mgr.store.save()
-
-        folder = pl["folder"]
-        (app.mgr.writer.root / folder).mkdir(parents=True, exist_ok=True)
-
-        source_root = Path(app.mgr.config.source_root)
-        for entry in data.get("tracks", []):
-            src_path = entry.get("src_path", "")
-            if not src_path:
-                continue
-            full = _resolve_source_file(src_path, source_root)
-            if full:
-                title, artist = _read_tags_from_file(full)
-                app.staging.stage_add(pid, str(full), title, artist)
-        app._invalidate_caches(pid)
+        """Onload through the real App action and its background worker (this used
+        to re-implement the onload logic inline)."""
+        with patch("echolist.gui.messagebox.showinfo"):
+            app._onload_playlist(pid)
+            _flush_bg_ops(app)
 
     def test_onload_stages_tracks_for_sync(self, app, gui_env):
         """Onload must stage tracks from backup for re-syncing."""

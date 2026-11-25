@@ -131,13 +131,17 @@ It should work with any player that reads metadata from FLAC/MP3/M4A files and b
 No. EchoList only writes to the destination folder. Your source library is read-only.
 
 **What formats are supported?**
-FLAC, MP3, M4A/MP4/AAC. WAV and OGG are not tagged.
+FLAC, MP3, M4A/MP4 (including AAC in an MP4 container), WAV and AIFF are tagged. WAV/AIFF tags are written as an ID3 chunk; whether the Echo Mini shows ID3 tags in WAV files is not yet confirmed on a device. OGG, WMA, DSF/DFF and raw ADTS `.aac` files are copied but not tagged, so they won't group under the playlist in the album/artist browser.
 
 **Can I use this without an Echo Mini?**
 Yes — you can point it at any folder. It's useful for organizing music on SD cards, USB sticks, or any portable player.
 
 **What happens if I unplug the device mid-sync?**
 EchoList has a sync journal. On next launch it detects the interrupted sync and picks up where it left off.
+Each file is written to a temporary name, flushed (`fsync`), renamed into place, and then the folder is flushed where the system supports it, so a finished step stays finished. That orders the writes; it cannot make a FAT32 card safe to pull mid-write — FAT32 has no journal, and the card's own controller may still be caching. Always eject the device before unplugging it.
+
+**Why are there `._` files on my card after using a Mac?**
+macOS keeps file attributes on FAT32 in hidden `._<name>` files, which the Echo Mini lists as broken tracks. EchoList deletes the ones its own writes create. Files you copy with Finder still get them; `dot_clean -m /Volumes/<card>` removes them.
 
 **I have playlists in MusicBee/foobar2000 — can I import them?**
 Yes. Export as `.m3u` from your player, then File → Import .m3u in EchoList.
