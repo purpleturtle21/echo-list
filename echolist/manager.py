@@ -14,18 +14,21 @@ from pathlib import Path
 
 from .safe_write import SafeWriter, UnsafeWriteError
 from .config import (
-    Config, DEFAULT_PLAYLIST_FOLDER,
+    CONFIG_REL, Config, DEFAULT_PLAYLIST_FOLDER,
+    bind_workspace_state, new_workspace_uuid,
     save_backup, list_backups, list_all_backup_pids, load_backup,
     save_playlist_snapshot, load_playlist_snapshot,
 )
+from .formats import AUDIO_EXTS
 from .store import Store
 from .naming import playlist_id, sanitize, track_filename
-from .tags import apply_playlist_tags, read_playlist_tags, restore_tags
+from .tags import (
+    apply_playlist_tags, read_playlist_tags, read_title, restore_tags, snapshot_tags,
+    tags_supported,
+)
 
-try:
-    import mutagen
-except ImportError:
-    mutagen = None
+
+LOCK_REL = ".echolist/workspace.lock"
 
 
 class WorkspaceLockError(Exception):
@@ -59,11 +62,12 @@ class PlaylistManager:
             album_prefix=album_prefix,
             playlist_folder=playlist_folder,
             backup_interval=backup_interval,
+            workspace_uuid=_existing_uuid(writer),
         )
         store = Store.load(writer)
         mgr = cls(writer, config, store)
         mgr._acquire_lock()
-        config.save(writer)
+        mgr._bind_workspace_state()
         return mgr
 
     @classmethod
@@ -79,13 +83,20 @@ class PlaylistManager:
         store = Store.load(writer)
         mgr = cls(writer, config, store)
         mgr._acquire_lock()
+        mgr._bind_workspace_state()
         return mgr
 
+    def _bind_workspace_state(self) -> None:
+        """Give the card a UUID if it has none (saving config), then move any
+        mount-path-keyed local state to it (see config.bind_workspace_state)."""
+        if not self.config.workspace_uuid:
+            self.config.workspace_uuid = new_workspace_uuid()
+        self.config.save(self.writer)
+        bind_workspace_state(self.writer.root, self.store.playlists.keys())
+
     def _acquire_lock(self) -> None:
-        lock_path = self.writer.root / ".echolist" / "workspace.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+            fd = self.writer.open_lock(LOCK_REL)
             if os.name == "nt":
                 import msvcrt
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -210,7 +221,7 @@ class PlaylistManager:
 
     def _ensure_workspace(self) -> None:
         if not self.writer.root.exists():
-            self.writer.root.mkdir(parents=True, exist_ok=True)
+            self.writer.makedirs(".")
             self.config.save(self.writer)
 
     def add_track(self, pid: str, src: str | Path, progress_cb=None) -> str:
@@ -240,16 +251,18 @@ class PlaylistManager:
 
         original_tags = read_playlist_tags(src)
 
-        _, src_hash = self.writer.copy_in(src, rel, progress_cb=progress_cb, compute_hash=True)
-
         album = self.config.album_prefix + playlist["name"]
-        apply_playlist_tags(
-            self.writer.resolve(rel),
-            self.config.node_name,
-            album,
-            index,
-            src_rel,
-            pid,
+
+        def _tag_temp_copy(tmp: Path) -> None:
+            apply_playlist_tags(
+                tmp, self.config.node_name, album, index, src_rel, pid, suffix=ext,
+            )
+
+        # Tag the temp copy before it gets its final name, so a failed tag
+        # write never leaves an untagged track for rescan to adopt.
+        _, src_hash = self.writer.copy_in(
+            src, rel, progress_cb=progress_cb, compute_hash=True,
+            before_commit=_tag_temp_copy,
         )
 
         self.store.add_track(pid, {
@@ -351,7 +364,9 @@ class PlaylistManager:
             track_path = folder_path / copy_name
             if not track_path.exists():
                 continue
-            if track_path.suffix.lower() not in AUDIO_EXTS:
+            if not tags_supported(track_path):
+                # OGG, WMA, DSF, raw ADTS AAC...: copied but never tagged,
+                # so they can't be "fixed" either.
                 continue
 
             tags = read_playlist_tags(track_path)
@@ -452,7 +467,8 @@ class PlaylistManager:
         album = self.config.album_prefix + playlist["name"]
         def _apply(job):
             path, index, src_rel = job
-            apply_playlist_tags(path, self.config.node_name, album, index, src_rel, pid)
+            self.writer.edit_in_place(path, lambda p: apply_playlist_tags(
+                p, self.config.node_name, album, index, src_rel, pid))
 
         with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
             list(pool.map(_apply, fix_jobs))
@@ -505,7 +521,7 @@ class PlaylistManager:
                         track_path = folder_path / cur_name
             if not track_path.exists():
                 continue
-            restore_tags(track_path, tags)
+            self.writer.edit_in_place(track_path, lambda p, tags=tags: restore_tags(p, tags))
             restored += 1
 
         return restored
@@ -581,7 +597,7 @@ class PlaylistManager:
             track_path = folder_path / entry["copy_name"]
             tags = entry.get("tags")
             if track_path.exists() and tags:
-                restore_tags(track_path, tags)
+                self.writer.edit_in_place(track_path, lambda p, tags=tags: restore_tags(p, tags))
                 restored += 1
                 new_tracks.append({
                     "index": entry["index"],
@@ -713,8 +729,15 @@ class PlaylistManager:
 
         self.store.add_playlist(pid, folder_name, folder_name)
 
+        def _read(f):
+            # read_playlist_tags for matching; snapshot_tags so the restore
+            # point brings back every field the tagger is about to change.
+            return read_playlist_tags(f), snapshot_tags(f)
+
         with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
-            tag_results = list(pool.map(read_playlist_tags, audio_files))
+            read_results = list(pool.map(_read, audio_files))
+        tag_results = [r[0] for r in read_results]
+        snapshots = {f.name: r[1] for f, r in zip(audio_files, read_results)}
 
         for i, (f, original_tags) in enumerate(zip(audio_files, tag_results), 1):
             self.store.add_track(pid, {
@@ -737,7 +760,10 @@ class PlaylistManager:
                     "src_path": "",
                     "src_hash": "",
                     "original_tags": t["original_tags"],
-                    "tags": t["original_tags"],
+                    "tags": (
+                        {**t["original_tags"], "raw": snapshots[t["copy_name"]]}
+                        if snapshots.get(t["copy_name"]) else t["original_tags"]
+                    ),
                 }
                 for t in self.store.playlists[pid]["tracks"]
             ],
@@ -747,10 +773,9 @@ class PlaylistManager:
         def _apply_tags(t):
             track_path = folder_path / t["copy_name"]
             if track_path.exists():
-                apply_playlist_tags(
-                    track_path, self.config.node_name, album,
-                    t["index"], "", pid,
-                )
+                self.writer.edit_in_place(track_path, lambda p: apply_playlist_tags(
+                    p, self.config.node_name, album, t["index"], "", pid,
+                ))
 
         with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
             list(pool.map(_apply_tags, self.store.playlists[pid]["tracks"]))
@@ -775,7 +800,15 @@ class PlaylistManager:
         return load_playlist_snapshot(workspace_root)
 
 
-AUDIO_EXTS = frozenset({".flac", ".mp3", ".m4a", ".wav", ".ogg", ".aac", ".wma", ".alac", ".aiff", ".dsf", ".dff"})
+def _existing_uuid(writer: SafeWriter) -> str:
+    """The workspace UUID already on the card (re-init keeps the card's
+    identity), or "" if there is none or the config is unreadable."""
+    if not (writer.root / CONFIG_REL).exists():
+        return ""
+    try:
+        return Config.load(writer).workspace_uuid
+    except (ValueError, OSError):
+        return ""
 
 
 def _is_real_audio(p: Path) -> bool:
@@ -822,14 +855,6 @@ def _strip_index_prefix(name: str) -> str:
 
 
 def _read_title(path: Path) -> str:
-    if mutagen is None:
-        return path.stem
-    try:
-        m = mutagen.File(path, easy=True)
-        if m and "title" in m:
-            return m["title"][0]
-    except Exception:
-        pass
-    return path.stem
+    return read_title(path) or path.stem
 
 
